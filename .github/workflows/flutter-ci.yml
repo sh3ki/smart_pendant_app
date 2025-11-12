@@ -1,0 +1,43 @@
+name: Flutter CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        flutter-version: '3.16.0'
+        channel: 'stable'
+    
+    - name: Get dependencies
+      run: flutter pub get
+    
+    - name: Verify formatting
+      run: dart format --set-exit-if-changed .
+      continue-on-error: true
+    
+    - name: Analyze code
+      run: flutter analyze
+      continue-on-error: true
+    
+    - name: Run tests
+      run: flutter test
+    
+    - name: Build Android APK
+      run: flutter build apk --debug
+    
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: app-debug
+        path: build/app/outputs/flutter-apk/app-debug.apk

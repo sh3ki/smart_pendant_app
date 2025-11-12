@@ -1,0 +1,314 @@
+{
+  "info": {
+    "name": "Smart Pendant API",
+    "description": "API collection for Smart Pendant backend endpoints",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://api.smartpendant.example.com",
+      "type": "string"
+    },
+    {
+      "key": "deviceId",
+      "value": "pendant-001",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"parent@example.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["auth", "login"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Device Management",
+      "item": [
+        {
+          "name": "Get All Devices",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/devices",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices"]
+            }
+          }
+        },
+        {
+          "name": "Get Device Detail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Telemetry",
+      "item": [
+        {
+          "name": "Get Latest Telemetry",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/telemetry",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "telemetry"]
+            }
+          }
+        },
+        {
+          "name": "Upload Telemetry (Device)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceId\": \"pendant-001\",\n  \"timestamp\": \"2025-10-10T12:00:00Z\",\n  \"lat\": 37.7749,\n  \"lon\": -122.4194,\n  \"accuracyMeters\": 5.0,\n  \"speed\": 1.5,\n  \"alt\": 10.0,\n  \"batteryPercent\": 75,\n  \"signalDbm\": -70,\n  \"motionState\": \"walk\",\n  \"firmwareVersion\": \"1.0.0\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/devices/{{deviceId}}/telemetry",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "devices", "{{deviceId}}", "telemetry"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Camera",
+      "item": [
+        {
+          "name": "Get Latest Image",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/latest-image",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "latest-image"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Request Snapshot Command",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command\": \"capture_snapshot\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/command",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "command"]
+            }
+          }
+        },
+        {
+          "name": "Upload Image (Device)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": []
+                },
+                {
+                  "key": "timestamp",
+                  "value": "2025-10-10T12:00:00Z",
+                  "type": "text"
+                },
+                {
+                  "key": "imageWidth",
+                  "value": "320",
+                  "type": "text"
+                },
+                {
+                  "key": "imageHeight",
+                  "value": "240",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/devices/{{deviceId}}/image",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "devices", "{{deviceId}}", "image"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Audio",
+      "item": [
+        {
+          "name": "Start Audio Command",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command\": \"start_audio\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/command",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "command"]
+            }
+          }
+        },
+        {
+          "name": "Stop Audio Command",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"command\": \"stop_audio\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/command",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "command"]
+            }
+          }
+        },
+        {
+          "name": "Upload Audio Chunk (Device)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceId\": \"pendant-001\",\n  \"timestamp\": \"2025-10-10T12:00:00Z\",\n  \"chunkIndex\": 0,\n  \"pcmBase64\": \"BASE64_ENCODED_AUDIO_DATA\",\n  \"sampleRate\": 16000,\n  \"channels\": 1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/devices/{{deviceId}}/audio-chunk",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "devices", "{{deviceId}}", "audio-chunk"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "SOS Alerts",
+      "item": [
+        {
+          "name": "Get SOS Alerts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/alerts",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "alerts"]
+            }
+          }
+        },
+        {
+          "name": "Mark Alert as Handled",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/alerts/:alertId/acknowledge",
+              "host": ["{{baseUrl}}"],
+              "path": ["devices", "{{deviceId}}", "alerts", ":alertId", "acknowledge"],
+              "variable": [
+                {
+                  "key": "alertId",
+                  "value": "sos-001"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Send SOS Alert (Device)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceId\": \"pendant-001\",\n  \"timestamp\": \"2025-10-10T12:00:00Z\",\n  \"lat\": 37.7749,\n  \"lon\": -122.4194,\n  \"alertType\": \"SOS\",\n  \"imageId\": \"img-123\",\n  \"audioChunksRef\": \"audio-session-456\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/devices/{{deviceId}}/alert",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "devices", "{{deviceId}}", "alert"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

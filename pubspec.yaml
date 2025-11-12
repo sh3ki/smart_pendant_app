@@ -1,0 +1,149 @@
+name: smart_pendant_app
+description: A Flutter mobile app for parents to monitor Smart Pendant wearable devices
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+  flutter: '>=3.16.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.5.1
+  riverpod_annotation: ^2.3.5
+
+  # HTTP & Networking
+  dio: ^5.4.3+1
+  retrofit: ^4.1.0
+  retrofit_generator: ^8.1.0
+  json_annotation: ^4.9.0
+  pretty_dio_logger: ^1.3.1
+
+  # Real-time Communication
+  web_socket_channel: ^2.4.5
+  mqtt_client: ^10.2.0
+
+  # Push Notifications
+  # firebase_core: ^2.31.0  # Temporarily disabled due to jlink/Gradle issue
+  # firebase_messaging: ^14.9.2  # Temporarily disabled due to jlink/Gradle issue
+  # flutter_local_notifications: ^17.1.2  # Temporarily disabled due to jlink/Gradle issue
+
+  # Maps
+  google_maps_flutter: ^2.6.1
+  google_maps_flutter_platform_interface: ^2.6.0
+  # geolocator: ^10.1.0  # Temporarily disabled due to Gradle plugin compatibility
+  geocoding: ^3.0.0
+
+  # Media & UI
+  cached_network_image: ^3.3.1
+  # just_audio: ^0.9.38  # Temporarily disabled due to jlink/Gradle issue
+  record: ^5.0.4  # Audio recording (using stable version to avoid Gradle issues)
+  audioplayers: ^6.0.0  # Audio playback (lighter alternative)
+  fl_chart: ^0.68.0
+  shimmer: ^3.0.0
+  lottie: ^3.1.2
+  flutter_svg: ^2.0.10+1
+
+  # Storage & Security
+  flutter_secure_storage: ^9.2.2
+  shared_preferences: ^2.2.3
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  path_provider: ^2.1.3
+
+  # Device Features
+  permission_handler: ^11.3.1
+  url_launcher: ^6.3.0
+  share_plus: ^9.0.0
+  package_info_plus: ^6.0.0
+  device_info_plus: ^10.1.0
+  vibration: ^1.8.4  # For stronger vibration alerts
+
+  # Utilities
+  intl: ^0.19.0
+  equatable: ^2.0.5
+  freezed_annotation: ^2.4.1
+  logger: ^2.3.0
+  # connectivity_plus: ^6.0.3  # Temporarily disabled due to jlink/Gradle issue
+  flutter_dotenv: ^5.1.0
+  uuid: ^4.4.0
+
+  # UI Components
+  cupertino_icons: ^1.0.6
+  flutter_slidable: ^3.1.0
+  pull_to_refresh: ^2.0.0
+  badges: ^3.1.2
+  shimmer_animation: ^2.1.0+1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+  # Code Generation
+  build_runner: ^2.4.9
+  hive_generator: ^2.0.1
+  json_serializable: ^6.8.0
+  freezed: ^2.5.2
+  riverpod_generator: ^2.4.0
+  riverpod_lint: ^2.3.10
+
+  # Testing
+  mockito: ^5.4.4
+  mocktail: ^1.0.3
+  flutter_lints: ^3.0.2
+
+  # Build Tools
+  flutter_launcher_icons: ^0.13.1
+  flutter_native_splash: ^2.4.0
+  change_app_package_name: ^1.2.0
+
+# # App Icons Configuration (uncomment when assets are ready)
+# flutter_launcher_icons:
+#   android: true
+#   ios: true
+#   image_path: "assets/images/app_icon.png"
+#   adaptive_icon_background: "#FFFFFF"
+#   adaptive_icon_foreground: "assets/images/app_icon_foreground.png"
+
+# # Splash Screen Configuration (uncomment when assets are ready)
+# flutter_native_splash:
+#   color: "#FFFFFF"
+#   image: assets/images/splash_icon.png
+#   android: true
+#   ios: true
+#   android_12:
+#     color: "#FFFFFF"
+#     image: assets/images/splash_icon.png
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+    - assets/icons/
+    - assets/animations/
+    - .env
+    - .env.dev
+    - .env.staging
+    - .env.prod
+
+  # fonts:
+  #   - family: Roboto
+  #     fonts:
+  #       - asset: assets/fonts/Roboto-Regular.ttf
+  #       - asset: assets/fonts/Roboto-Bold.ttf
+  #         weight: 700
+  #       - asset: assets/fonts/Roboto-Medium.ttf
+  #         weight: 500
+
+# Force older stable versions to avoid Gradle issues
+dependency_overrides:
+  record: 5.0.4
+  record_android: 1.2.4
+  record_linux: 0.7.1
+  record_platform_interface: 1.0.0
