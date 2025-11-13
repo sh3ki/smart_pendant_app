@@ -15,8 +15,8 @@ class CameraNotifier extends StateNotifier<CameraState> {
   List<Map<String, dynamic>> _frameBuffer = [];
   int _currentFrameIndex = 0;
   
-  // Update this with your server IP
-  static const String SERVER_URL = 'http://192.168.1.11:3000';
+  // Render deployment URL (public internet)
+  static const String SERVER_URL = 'https://kiddieguard.onrender.com';
 
   CameraNotifier() : super(CameraState());
 
