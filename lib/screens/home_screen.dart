@@ -79,37 +79,35 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             ),
             const SizedBox(height: 16),
 
-            // Quick actions
-            GridView.count(
-              crossAxisCount: 2,
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              mainAxisSpacing: 12,
-              crossAxisSpacing: 12,
+            // Quick actions (3 cards centered)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _QuickActionCard(
-                  icon: Icons.map,
-                  label: 'Map',
-                  color: Colors.blue,
-                  onTap: () => Navigator.pushNamed(context, '/map'),
+                Expanded(
+                  child: _QuickActionCard(
+                    icon: Icons.map,
+                    label: 'Map',
+                    color: Colors.blue,
+                    onTap: () => Navigator.pushNamed(context, '/map'),
+                  ),
                 ),
-                _QuickActionCard(
-                  icon: Icons.camera_alt,
-                  label: 'Camera',
-                  color: Colors.purple,
-                  onTap: () => Navigator.pushNamed(context, '/camera'),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _QuickActionCard(
+                    icon: Icons.mic,
+                    label: 'Speak',
+                    color: Colors.orange,
+                    onTap: () => Navigator.pushNamed(context, '/audio'),
+                  ),
                 ),
-                _QuickActionCard(
-                  icon: Icons.mic,
-                  label: 'Speak',
-                  color: Colors.orange,
-                  onTap: () => Navigator.pushNamed(context, '/audio'),
-                ),
-                _QuickActionCard(
-                  icon: Icons.directions_run,
-                  label: 'Activity',
-                  color: Colors.green,
-                  onTap: () => Navigator.pushNamed(context, '/activity'),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _QuickActionCard(
+                    icon: Icons.directions_run,
+                    label: 'Activity',
+                    color: Colors.green,
+                    onTap: () => Navigator.pushNamed(context, '/activity'),
+                  ),
                 ),
               ],
             ),
