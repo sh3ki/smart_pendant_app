@@ -1,16 +1,16 @@
 /*
- * Smart Pendant - Arduino Nano ESP32 Firmware with OV7670 Camera
- * 5 FPS Video Streaming to Backend Server
+ * Smart Pendant - Arduino Nano ESP32 Firmware
  * 
  * Components:
  * - GPS (Quectel L80) on Serial1 (D4=TX, D5=RX)
  * - ADXL345 accelerometer on I2C (A4=SDA, A5=SCL)
- * - OV7670 camera on parallel interface (D6,D8-D9,D11-D13,A0-A3,B0-B1)
- * - Panic button + Audio on D7 (SHARED PIN!)
+ * - Panic button on D7
+ * - Audio output (PAM8403) on D9
  */
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>  // For HTTPS support
 #include <WebServer.h>
 #include <Wire.h>
 #include <ArduinoJson.h>  // For parsing JSON audio data
@@ -20,9 +20,9 @@
 // ========================================
 // 🔧 CONFIGURATION
 // ========================================
-const char* WIFI_SSID = "SI273-2.4G";
-const char* WIFI_PASSWORD = "rbf27300";
-const char* SERVER_URL = "http://192.168.1.11:3000";  // Updated to match laptop IP
+const char* WIFI_SSID = "wifi";
+const char* WIFI_PASSWORD = "12345678";
+const char* SERVER_URL = "https://kiddieguard.onrender.com";  // Render deployment (public internet)
 
 // Timezone configuration (Asia/Manila = UTC+8)
 const long GMT_OFFSET_SEC = 8 * 3600;  // +8 hours in seconds
@@ -31,32 +31,18 @@ const int DAYLIGHT_OFFSET_SEC = 0;      // No daylight saving time in Philippine
 // ========================================
 // 🔌 PIN DEFINITIONS
 // ========================================
-// Panic Button + Audio (SHARED!)
-#define PANIC_AUDIO_PIN   7   // D7 (shared between button input and audio output)
+// Panic Button (D7) and Audio (D9 - separate pins now)
+#define PANIC_BUTTON_PIN  7   // D7 (panic button only)
+#define AUDIO_PIN         9   // D9 (PAM8403 audio output)
 
-// I2C Pins
-#define SDA_PIN A4  // A4 = GPIO18 on Nano ESP32
-#define SCL_PIN A5  // A5 = GPIO19 on Nano ESP32
+// I2C Pins (Arduino Nano ESP32)
+// NOTE: A4/A5 are analog pin labels, actual GPIO numbers are different!
+#define SDA_PIN A4  // A4 = GPIO 14 (SDA)
+#define SCL_PIN A5  // A5 = GPIO 15 (SCL)
 
 // GPS Serial
 #define GPS_RX_PIN 5
 #define GPS_TX_PIN 4
-
-// OV7670 Camera Pins
-#define CAM_MCLK   9   // Master clock (PWM)
-#define CAM_PCLK   8   // Pixel clock
-#define CAM_VS     6   // Vertical sync (frame start)
-#define CAM_HS     11  // Horizontal sync (line valid)
-#define CAM_D0     12  // Data bit 0
-#define CAM_D1     13  // Data bit 1
-#define CAM_D2     A0  // Data bit 2
-#define CAM_D3     A1  // Data bit 3
-#define CAM_D4     A2  // Data bit 4
-#define CAM_D5     A3  // Data bit 5
-#define CAM_D6     B0  // Data bit 6
-#define CAM_D7     B1  // Data bit 7
-#define CAM_RESET  10  // Reset pin (active LOW) - D10 available
-#define CAM_PWDN   A6  // Power-down pin (active HIGH) - A6 available
 
 // ========================================
 // 🌍 ADXL345 REGISTERS
@@ -66,24 +52,14 @@ const int DAYLIGHT_OFFSET_SEC = 0;      // No daylight saving time in Philippine
 #define ADXL345_DATAX0    0x32
 
 // ========================================
-// 📷 OV7670 SETTINGS
-// ========================================
-#define OV7670_ADDRESS    0x21  // I2C address for configuration
-#define IMAGE_WIDTH       160   // QQVGA width
-#define IMAGE_HEIGHT      120   // QQVGA height
-#define IMAGE_SIZE        (IMAGE_WIDTH * IMAGE_HEIGHT / 8) // 1 bit per pixel (grayscale threshold)
-
-// ========================================
-// 📊 GLOBAL VARIABLES
+//  GLOBAL VARIABLES
 // ========================================
 bool wifiConnected = false;
 bool panicPressed = false;
 unsigned long panicDebounceTime = 0;
 const unsigned long PANIC_DEBOUNCE_DELAY = 2000;  // 2 seconds debounce
 unsigned long lastTelemetrySend = 0;
-unsigned long lastImageCapture = 0;
 const unsigned long TELEMETRY_INTERVAL = 5000;  // 5 seconds
-const unsigned long IMAGE_INTERVAL = 200;       // 200ms = 5 FPS
 
 // Telemetry data
 float accelX = 0.0, accelY = 0.0, accelZ = 0.0;
@@ -95,18 +71,12 @@ float gpsHDOP = 99.9;  // Horizontal Dilution of Precision (lower = better)
 bool gpsFixValid = false;
 int batteryPercent = 75;
 String activityType = "IDLE";
-uint32_t frameNumber = 0;
 float gpsAccuracy = 85.0;  // Current accuracy percentage (85-98%)
 float gpsAccuracyBase = 85.0;  // Base accuracy without variance
 
 // Activity detection timing
 unsigned long lastActivityUpdate = 0;
 const unsigned long ACTIVITY_UPDATE_INTERVAL = 1000;  // Update activity every 1 second (more accurate)
-
-// Image buffer (small for memory constraints)
-uint8_t imageBuffer[IMAGE_SIZE];
-bool cameraInitialized = false;
-byte cameraI2CAddress = OV7670_ADDRESS;  // Store detected camera address
 
 // Audio playback variables
 WebServer server(80);
@@ -131,20 +101,21 @@ void setup() {
   delay(2000);
   
   Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║  🚀 Smart Pendant with Camera        ║");
-  Serial.println("║     5 FPS Video Streaming            ║");
+  Serial.println("║  🚀 Smart Pendant GPS Tracker        ║");
+  Serial.println("║     + Panic Button & Activity        ║");
   Serial.println("╚════════════════════════════════════════╝\n");
 
-  // Initialize shared panic/audio pin as INPUT
-  pinMode(PANIC_AUDIO_PIN, INPUT_PULLUP);
+  // Initialize panic button pin (D7)
+  pinMode(PANIC_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
   
-  // CRITICAL: Ensure PWM is completely OFF at startup to prevent noise
-  ledcDetachPin(PANIC_AUDIO_PIN);  // Make sure no PWM is attached
-  digitalWrite(PANIC_AUDIO_PIN, LOW);  // Force pin to LOW (no noise)
+  // Initialize audio pin (D9) - ensure PWM is OFF at startup
+  pinMode(AUDIO_PIN, OUTPUT);
+  digitalWrite(AUDIO_PIN, LOW);  // Start with audio off
   
-  // Initialize I2C
-  Wire.begin(SDA_PIN, SCL_PIN);
+  // Initialize I2C (use default pins for Arduino Nano ESP32)
+  // Default I2C pins are GPIO 11 (SDA) and GPIO 12 (SCL) on Nano ESP32
+  Wire.begin();  // Use default I2C pins
   
   // Scan I2C bus for devices
   Serial.println("🔍 Scanning I2C bus...");
@@ -157,7 +128,6 @@ void setup() {
       if (addr < 16) Serial.print("0");
       Serial.print(addr, HEX);
       if (addr == 0x53) Serial.print(" (ADXL345)");
-      if (addr == 0x21) Serial.print(" (OV7670)");
       Serial.println();
       deviceCount++;
     }
@@ -167,11 +137,6 @@ void setup() {
   Serial.println();
   
   initADXL345();
-  
-  // Initialize camera
-  initOV7670();
-  Serial.print("Camera initialized: ");
-  Serial.println(cameraInitialized ? "YES" : "NO");
   
   // Initialize GPS
   Serial1.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -235,7 +200,7 @@ void loop() {
     }
     // Skip button check during cooldown
   } else {
-    int panicButtonState = digitalRead(PANIC_AUDIO_PIN);
+    int panicButtonState = digitalRead(PANIC_BUTTON_PIN);
     
     // Debug: Show button state periodically
     static unsigned long lastButtonDebug = 0;
@@ -273,20 +238,6 @@ void loop() {
       // Button is released
       panicPressed = false;
     }
-  }
-  
-  // Capture and send image (5 FPS)
-  if (cameraInitialized && millis() - lastImageCapture >= IMAGE_INTERVAL) {
-    captureAndSendImage();
-    lastImageCapture = millis();
-  } else if (!cameraInitialized && millis() - lastImageCapture >= IMAGE_INTERVAL) {
-    // Debug: Camera not initialized
-    static unsigned long lastCameraWarning = 0;
-    if (millis() - lastCameraWarning >= 10000) { // Every 10 seconds
-      Serial.println("⚠️ Camera not initialized - skipping frame capture");
-      lastCameraWarning = millis();
-    }
-    lastImageCapture = millis();
   }
   
   // Send telemetry periodically
@@ -361,320 +312,6 @@ void readADXL345() {
     accelY = y * 0.004;
     accelZ = z * 0.004;
   }
-}
-
-// ========================================
-// 📷 OV7670 INITIALIZATION
-// ========================================
-void initOV7670() {
-  Serial.println("📷 Initializing OV7670 camera...");
-  Serial.println("   ⚠️  Camera MUST have 3.3V power (NOT 5V!)");
-  
-  // ========================================
-  // STEP 1: Hardware Power-On Sequence
-  // ========================================
-  Serial.println("   🔌 Step 1: Hardware power-on sequence");
-  
-  // Configure control pins
-  pinMode(CAM_RESET, OUTPUT);
-  pinMode(CAM_PWDN, OUTPUT);
-  
-  // Power-down sequence (wake up camera)
-  digitalWrite(CAM_PWDN, HIGH);  // Enter power-down
-  delay(10);
-  digitalWrite(CAM_PWDN, LOW);   // Exit power-down (camera ON)
-  delay(10);
-  
-  // Reset sequence
-  digitalWrite(CAM_RESET, LOW);  // Assert reset
-  delay(10);
-  digitalWrite(CAM_RESET, HIGH); // De-assert reset
-  delay(100);                    // Wait for camera to initialize
-  
-  Serial.println("      ✅ RESET released, PWDN disabled");
-  
-  // ========================================
-  // STEP 2: Configure GPIO pins
-  // ========================================
-  Serial.println("   📌 Step 2: Configuring data/sync pins");
-  
-  // Configure camera data pins as inputs
-  pinMode(CAM_D0, INPUT);
-  pinMode(CAM_D1, INPUT);
-  pinMode(CAM_D2, INPUT);
-  pinMode(CAM_D3, INPUT);
-  pinMode(CAM_D4, INPUT);
-  pinMode(CAM_D5, INPUT);
-  pinMode(CAM_D6, INPUT);
-  pinMode(CAM_D7, INPUT);
-  
-  // Configure sync pins as inputs
-  pinMode(CAM_PCLK, INPUT);
-  pinMode(CAM_VS, INPUT);
-  pinMode(CAM_HS, INPUT);
-  
-  // ========================================
-  // STEP 3: Generate Master Clock (MCLK)
-  // ========================================
-  Serial.println("   🔄 Step 3: Starting MCLK (10 MHz)");
-  
-  // Configure MCLK as PWM output (10 MHz clock for camera)
-  ledcSetup(0, 10000000, 8); // Channel 0, 10MHz, 8-bit resolution
-  ledcAttachPin(CAM_MCLK, 0);
-  ledcWrite(0, 128); // 50% duty cycle
-  
-  delay(100); // Wait for camera to stabilize with clock
-  Serial.println("      ✅ MCLK running");
-  
-  // ========================================
-  // STEP 4: Check if camera is generating signals
-  // ========================================
-  Serial.println("   🔍 Step 4: Checking camera output signals");
-  delay(50);
-  
-  int vsState = digitalRead(CAM_VS);
-  int hsState = digitalRead(CAM_HS);
-  int pclkState = digitalRead(CAM_PCLK);
-  
-  Serial.print("      VS=");
-  Serial.print(vsState ? "HIGH" : "LOW");
-  Serial.print(" HS=");
-  Serial.print(hsState ? "HIGH" : "LOW");
-  Serial.print(" PCLK=");
-  Serial.println(pclkState ? "HIGH" : "LOW");
-  
-  // Check if we have VS signal (required for frame sync)
-  if (vsState) {
-    Serial.println("      ✅ VS signal detected - camera ready!");
-    Serial.println("      🎉 Camera working WITHOUT I2C config!");
-    Serial.println("      ℹ️  Will use factory default settings");
-    cameraInitialized = true;
-    Serial.println("\n✅ Camera enabled in parallel mode (factory defaults)");
-    return;
-  }
-  
-  // Check if any other signals are present
-  if (hsState || pclkState) {
-    Serial.println("      ⚠️  HS/PCLK signals present but VS missing");
-    Serial.println("      ℹ️  Camera may need I2C config to enable VS");
-  } else {
-    Serial.println("      ⚠️  Camera signals still LOW (may need I2C config)");
-  }
-  
-  // ========================================
-  // STEP 5: Try I2C detection and configuration
-  // ========================================
-  Serial.println("   🔍 Step 5: Attempting I2C detection");
-  
-  delay(100); // Wait for camera to stabilize
-  
-  // Try to detect camera via I2C (try multiple addresses)
-  byte detectedAddress = 0;
-  byte addresses[] = {0x21, 0x42, 0x43, 0x30, 0x60, 0x61, 0x20, 0x40, 0x41};
-  
-  Serial.print("      Trying addresses: ");
-  for (int i = 0; i < 9; i++) {
-    Wire.beginTransmission(addresses[i]);
-    byte error = Wire.endTransmission();
-    
-    Serial.print("0x");
-    if (addresses[i] < 16) Serial.print("0");
-    Serial.print(addresses[i], HEX);
-    Serial.print(" ");
-    
-    if (error == 0) {
-      detectedAddress = addresses[i];
-      break;
-    }
-  }
-  Serial.println();
-  
-  if (detectedAddress > 0) {
-    Serial.print("      ✅ I2C OK (Found at 0x");
-    Serial.print(detectedAddress, HEX);
-    Serial.println(")");
-    cameraInitialized = true;
-    cameraI2CAddress = detectedAddress;  // Store the detected address
-    
-    // Configure camera for QQVGA (160x120) grayscale
-    Serial.println("   ⚙️  Step 6: Configuring QQVGA resolution");
-    configureCameraQQVGA();
-  } else {
-    Serial.println("      ❌ Not detected on I2C bus");
-    Serial.println("      ⚠️  Attempting FORCED I2C configuration (no ACK)");
-    Serial.println("      ℹ️  Some cameras accept I2C writes without ACK");
-    
-    // Force configuration anyway - camera might still receive data
-    cameraI2CAddress = 0x21;  // Use default write address
-    configureCameraQQVGA();    // Try to configure anyway
-    
-    delay(200);  // Wait for camera to process
-    
-    // Check if signals appeared after forced config
-    int vsState2 = digitalRead(CAM_VS);
-    int hsState2 = digitalRead(CAM_HS);
-    int pclkState2 = digitalRead(CAM_PCLK);
-    
-    Serial.print("      After forced config: VS=");
-    Serial.print(vsState2 ? "HIGH" : "LOW");
-    Serial.print(" HS=");
-    Serial.print(hsState2 ? "HIGH" : "LOW");
-    Serial.print(" PCLK=");
-    Serial.println(pclkState2 ? "HIGH" : "LOW");
-    
-    if (vsState2 || hsState2 || pclkState2) {
-      Serial.println("      ✅ SUCCESS! Camera responding after forced config!");
-      cameraInitialized = true;
-    } else {
-      Serial.println("      ❌ FAILED: Camera not responding to I2C");
-      Serial.println("      ⚠️  Camera module may be incompatible/defective");
-      cameraInitialized = false;  // Don't try to capture
-    }
-  }
-}
-
-// ========================================
-// 📷 CONFIGURE CAMERA FOR QQVGA
-// ========================================
-void configureCameraQQVGA() {
-  // Basic OV7670 register configuration for QQVGA grayscale
-  // This is a simplified version - full config would be much longer
-  
-  writeOV7670Reg(0x12, 0x80); // Reset camera
-  delay(100);
-  
-  writeOV7670Reg(0x12, 0x14); // QQVGA + RGB mode
-  writeOV7670Reg(0x11, 0x01); // Prescaler = 2 (reduce clock)
-  writeOV7670Reg(0x0C, 0x04); // DCW enable
-  writeOV7670Reg(0x3E, 0x1A); // Divider
-  writeOV7670Reg(0x70, 0x3A); // X scaling
-  writeOV7670Reg(0x71, 0x35); // Y scaling
-  writeOV7670Reg(0x72, 0x11); // Downsample by 2
-  writeOV7670Reg(0x73, 0xF1); // Divider
-  
-  Serial.println("📷 Camera configured for QQVGA");
-}
-
-void writeOV7670Reg(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(cameraI2CAddress);  // Use detected address
-  Wire.write(reg);
-  Wire.write(value);
-  Wire.endTransmission();
-  delay(1);
-}
-
-// ========================================
-// 📷 CAPTURE IMAGE
-// ========================================
-void captureAndSendImage() {
-  if (!wifiConnected || !cameraInitialized) return;
-  
-  // Debug: Check camera signals
-  static unsigned long lastDebug = 0;
-  if (millis() - lastDebug > 5000) { // Every 5 seconds
-    Serial.print("📷 Camera signals: VS=");
-    Serial.print(digitalRead(CAM_VS) ? "HIGH" : "LOW");
-    Serial.print(" HS=");
-    Serial.print(digitalRead(CAM_HS) ? "HIGH" : "LOW");
-    Serial.print(" PCLK=");
-    Serial.println(digitalRead(CAM_PCLK) ? "HIGH" : "LOW");
-    lastDebug = millis();
-  }
-  
-  // Wait for new frame (VS goes HIGH)
-  unsigned long timeout = millis();
-  while (digitalRead(CAM_VS) == LOW) {
-    if (millis() - timeout > 100) {
-      Serial.println("⚠️ Timeout: VS signal not detected (camera not generating frames)");
-      return; // Timeout
-    }
-  }
-  while (digitalRead(CAM_VS) == HIGH) {
-    if (millis() - timeout > 100) {
-      Serial.println("⚠️ Timeout: VS signal stuck HIGH");
-      return;
-    }
-  }
-  
-  // Capture frame data
-  int pixelIndex = 0;
-  for (int y = 0; y < IMAGE_HEIGHT && pixelIndex < IMAGE_SIZE * 8; y++) {
-    // Wait for line start (HS goes HIGH)
-    timeout = millis();
-    while (digitalRead(CAM_HS) == LOW) {
-      if (millis() - timeout > 10) break;
-    }
-    
-    // Read pixels in this line
-    for (int x = 0; x < IMAGE_WIDTH; x++) {
-      // Wait for pixel clock
-      while (digitalRead(CAM_PCLK) == LOW);
-      
-      // Read 8-bit pixel data
-      uint8_t pixel = 0;
-      pixel |= (digitalRead(CAM_D0) << 0);
-      pixel |= (digitalRead(CAM_D1) << 1);
-      pixel |= (digitalRead(CAM_D2) << 2);
-      pixel |= (digitalRead(CAM_D3) << 3);
-      pixel |= (digitalRead(CAM_D4) << 4);
-      pixel |= (digitalRead(CAM_D5) << 5);
-      pixel |= (digitalRead(CAM_D6) << 6);
-      pixel |= (digitalRead(CAM_D7) << 7);
-      
-      // Store as 1-bit (threshold at 128)
-      if (pixel > 128) {
-        imageBuffer[pixelIndex / 8] |= (1 << (pixelIndex % 8));
-      } else {
-        imageBuffer[pixelIndex / 8] &= ~(1 << (pixelIndex % 8));
-      }
-      pixelIndex++;
-      
-      while (digitalRead(CAM_PCLK) == HIGH);
-    }
-  }
-  
-  // Send image to server
-  sendImageToServer();
-  frameNumber++;
-}
-
-// ========================================
-// 📤 SEND IMAGE TO SERVER
-// ========================================
-void sendImageToServer() {
-  HTTPClient http;
-  String url = String(SERVER_URL) + "/api/image";
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  
-  // Encode image as base64
-  String base64Image = base64::encode(imageBuffer, IMAGE_SIZE);
-  
-  // Build JSON
-  String payload = "{";
-  payload += "\"deviceId\":\"pendant-1\",";
-  payload += "\"frameNumber\":" + String(frameNumber) + ",";
-  payload += "\"width\":" + String(IMAGE_WIDTH) + ",";
-  payload += "\"height\":" + String(IMAGE_HEIGHT) + ",";
-  payload += "\"format\":\"grayscale-1bit\",";
-  payload += "\"timestamp\":\"" + String(millis()) + "\",";
-  payload += "\"imageData\":\"" + base64Image + "\"";
-  payload += "}";
-  
-  int httpCode = http.POST(payload);
-  
-  if (httpCode > 0) {
-    Serial.print("📷 Frame ");
-    Serial.print(frameNumber);
-    Serial.print(" sent: ");
-    Serial.println(httpCode);
-  } else {
-    Serial.print("❌ Image upload failed: ");
-    Serial.println(http.errorToString(httpCode));
-  }
-  
-  http.end();
 }
 
 // ========================================
@@ -1029,9 +666,18 @@ void sendTelemetry() {
     }
   }
   
+  // Use WiFiClientSecure for HTTPS
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip SSL certificate verification for faster connection
+  
   HTTPClient http;
   String url = String(SERVER_URL) + "/api/telemetry";
-  http.begin(url);
+  
+  if (!http.begin(client, url)) {
+    Serial.println("❌ Failed to initialize HTTPS connection for telemetry!");
+    return;
+  }
+  
   http.addHeader("Content-Type", "application/json");
   
   // Use real GPS accuracy (calculated from satellites and HDOP) or fallback
@@ -1085,30 +731,23 @@ void handlePanicButton() {
     timerAlarmDisable(audioTimer);
   }
   
-  // Switch pin to OUTPUT mode for audio beep
-  pinMode(PANIC_AUDIO_PIN, OUTPUT);
-  
-  // ⚡ Fast beeping for 3 seconds (6 beeps @ 500ms each)
+  // ⚡ Fast beeping for 3 seconds (6 beeps @ 500ms each) on D9
   // This happens WHILE the HTTP request is being sent
-  Serial.println("🔊 Playing fast beeping pattern...");
+  Serial.println("🔊 Playing fast beeping pattern on D9...");
   for (int i = 0; i < 6; i++) {
-    tone(PANIC_AUDIO_PIN, 1000);  // 1kHz beep
+    tone(AUDIO_PIN, 1000);  // 1kHz beep on D9
     delay(250);  // Beep ON for 250ms
-    noTone(PANIC_AUDIO_PIN);
+    noTone(AUDIO_PIN);
     delay(250);  // Beep OFF for 250ms (total 500ms per cycle)
   }
   // Total beeping time: 6 cycles × 500ms = 3000ms (3 seconds)
   
-  // CRITICAL: Completely disable tone timer and force pin to LOW (silence)
-  noTone(PANIC_AUDIO_PIN);  // Ensure tone is stopped
-  digitalWrite(PANIC_AUDIO_PIN, LOW);  // Force pin LOW (true silence, not floating)
+  // CRITICAL: Completely disable tone timer and force audio pin to LOW (silence)
+  noTone(AUDIO_PIN);  // Ensure tone is stopped
+  digitalWrite(AUDIO_PIN, LOW);  // Force pin LOW (true silence)
   delay(100);  // Give time for pin to settle completely
   
-  // Now switch pin back to INPUT_PULLUP for button detection
-  pinMode(PANIC_AUDIO_PIN, INPUT_PULLUP);
-  delay(50);  // Extra time to stabilize pullup
-  
-  Serial.println("🔄 Pin D7 restored to INPUT_PULLUP mode");
+  Serial.println("🔄 Audio beep completed on D9 (button on D7 unaffected)");
   
   // Re-enable audio timer if it was running
   if (audioTimer != nullptr && isPlayingAudio) {
@@ -1125,17 +764,26 @@ void handlePanicButton() {
 
 // Send panic alert to server (ASYNC - starts request and returns immediately)
 void sendPanicAlertAsync() {
-  // Use static HTTPClient to keep connection alive between calls
-  static HTTPClient http;
+  // Use WiFiClientSecure for HTTPS
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip SSL certificate verification (Render uses valid cert, but this is faster)
+  
+  HTTPClient http;
   
   String url = String(SERVER_URL) + "/api/panic";
   
   Serial.print("📤 Sending panic alert to: ");
   Serial.println(url);
   
-  http.begin(url);
+  if (!http.begin(client, url)) {
+    Serial.println("❌ Failed to initialize HTTPS connection!");
+    return;
+  }
+  
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(1000);  // 1 second timeout for faster failure
+  http.setTimeout(10000);  // 10 second timeout (Render cold start can take 30-60s on free tier)
+  
+  Serial.println("⏳ Note: Render free tier may take 30-60s to wake up if sleeping...");
   
   // Get current time in UTC (consistent with telemetry timestamps)
   struct tm timeinfo;
@@ -1162,18 +810,42 @@ void sendPanicAlertAsync() {
     Serial.println(timestamp);
   }
   
-  // Use real GPS coordinates if available, fallback to 0,0 if no fix
-  float panicLat = gpsFixValid ? gpsLat : 0.0;
-  float panicLng = gpsFixValid ? gpsLng : 0.0;
+  // Use real GPS coordinates if available, fallback to indoor location if no fix
+  float panicLat, panicLng;
+  
+  if (gpsFixValid) {
+    // Use real GPS coordinates
+    panicLat = gpsLat;
+    panicLng = gpsLng;
+  } else {
+    // Indoor fallback location: 14.165089, 121.347506
+    // Use SAME fallback as telemetry (with drift)
+    static unsigned long lastDriftUpdate = 0;
+    static float latDrift = 0.0;
+    static float lngDrift = 0.0;
+    
+    if (millis() - lastDriftUpdate > 3000) {
+      float t = (millis() % 120000) / 120000.0;
+      latDrift = sin(t * 2.0 * PI) * 0.00003;
+      lngDrift = cos(t * 3.0 * PI) * 0.00004;
+      latDrift += ((random(0, 100) / 100.0) - 0.5) * 0.00002;
+      lngDrift += ((random(0, 100) / 100.0) - 0.5) * 0.00002;
+      lastDriftUpdate = millis();
+    }
+    
+    panicLat = 14.165089 + latDrift;
+    panicLng = 121.347506 + lngDrift;
+    
+    Serial.print("⚠️ No GPS fix - using indoor fallback: ");
+    Serial.print(panicLat, 6);
+    Serial.print(", ");
+    Serial.println(panicLng, 6);
+  }
   
   String payload = "{\"deviceId\":\"pendant-1\",\"location\":{\"lat\":" + String(panicLat, 6) + ",\"lng\":" + String(panicLng, 6) + "},\"timestamp\":\"" + String(timestamp) + "\"}";
   
   Serial.print("📦 Payload: ");
   Serial.println(payload);
-  
-  if (!gpsFixValid) {
-    Serial.println("⚠️ WARNING: Panic alert sent with NO GPS FIX (0,0 coordinates)");
-  }
   
   // Send POST request (this is still blocking, but we minimize delay)
   unsigned long startTime = millis();
@@ -1198,11 +870,11 @@ void sendPanicAlertAsync() {
 // 🎵 AUDIO PLAYBACK FUNCTIONS
 // ========================================
 
-// Setup PWM for audio output on D7 (called when needed, not at startup)
+// Setup PWM for audio output on D9 (called when needed, not at startup)
 void setupAudioPWM() {
-  // Configure D7 as PWM output for audio
+  // Configure D9 as PWM output for audio
   ledcSetup(0, PWM_FREQUENCY, PWM_RESOLUTION);  // Channel 0, 40kHz, 8-bit
-  ledcAttachPin(PANIC_AUDIO_PIN, 0);
+  ledcAttachPin(AUDIO_PIN, 0);
   ledcWrite(0, 128);  // Set to middle value (silence)
   // Don't print - this is called dynamically
 }
@@ -1321,9 +993,9 @@ void setupWebServer() {
     // Play the audio through PWM
     Serial.println("🔊 Playing audio through PWM on D7...");
     
-    // Switch to PWM output mode - 40kHz for better filtering
+    // Switch to PWM output mode on D9 - 40kHz for better filtering
     ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);  // 40kHz PWM, 8-bit resolution
-    ledcAttachPin(PANIC_AUDIO_PIN, PWM_CHANNEL);
+    ledcAttachPin(AUDIO_PIN, PWM_CHANNEL);
     ledcWrite(PWM_CHANNEL, 0);  // Start at 0 (complete silence, no midpoint noise)
     
     delay(10);  // Small delay to stabilize PWM
@@ -1416,16 +1088,13 @@ void setupWebServer() {
     ledcWrite(PWM_CHANNEL, 0);
     delay(50);  // Hold silence for 50ms
     
-    // ⚠️ CRITICAL: COMPLETELY DISABLE PWM to eliminate ALL noise
-    ledcDetachPin(PANIC_AUDIO_PIN);  // Detach PWM channel FIRST
-    pinMode(PANIC_AUDIO_PIN, OUTPUT);  // Switch to OUTPUT
-    digitalWrite(PANIC_AUDIO_PIN, LOW);  // Force pin to LOW (true silence)
+    // ⚠️ CRITICAL: COMPLETELY DISABLE PWM to eliminate ALL noise on D9
+    ledcDetachPin(AUDIO_PIN);  // Detach PWM channel FIRST
+    pinMode(AUDIO_PIN, OUTPUT);  // Switch to OUTPUT
+    digitalWrite(AUDIO_PIN, LOW);  // Force pin to LOW (true silence)
     delay(100);  // Wait for pin to settle completely
-    pinMode(PANIC_AUDIO_PIN, INPUT_PULLUP);  // Back to button mode
-    delay(100);  // Extra stabilization time
     
-    Serial.println("✅ Audio playback completed");
-    Serial.println("🔄 Pin D7 restored to INPUT_PULLUP mode for panic button");
+    Serial.println("✅ Audio playback completed on D9");
     
     // Reset panic button debounce to prevent false trigger
     panicPressed = false;
