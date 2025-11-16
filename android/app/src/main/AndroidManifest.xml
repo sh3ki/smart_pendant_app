@@ -8,6 +8,11 @@
     <!-- Permissions for panic alert vibration -->
     <uses-permission android:name="android.permission.VIBRATE"/>
     
+    <!-- Permissions for location (required for map and mobile device location) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+    
     <application
         android:label="smart_pendant_app"
         android:name="${applicationName}"
