@@ -34,8 +34,9 @@ dependencies:
   # Maps
   google_maps_flutter: ^2.6.1
   google_maps_flutter_platform_interface: ^2.6.0
-  # geolocator: ^10.1.0  # Temporarily disabled due to Gradle plugin compatibility
+  # geolocator: ^11.0.0  # Disabled due to Gradle compatibility issues
   geocoding: ^3.0.0
+  location: ^5.0.3  # Lightweight location package (no Gradle issues)
 
   # Media & UI
   cached_network_image: ^3.3.1
