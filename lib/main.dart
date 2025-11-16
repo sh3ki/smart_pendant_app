@@ -5,6 +5,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'models/audio_recording.dart';
 import 'services/local_storage_service.dart';
+import 'services/location_service.dart';
 import 'screens/home_screen.dart';
 import 'screens/map_screen.dart';
 import 'screens/camera_screen.dart';
@@ -38,6 +39,14 @@ void main() async {
     print('✅ Local storage initialized successfully');
   } catch (e) {
     print('❌ Failed to initialize local storage: $e');
+  }
+  
+  // Request location permission (for Android 13+ compatibility)
+  try {
+    await LocationService().requestLocationPermission();
+    print('✅ Location permission requested');
+  } catch (e) {
+    print('⚠️ Failed to request location permission: $e');
   }
   
   runApp(const ProviderScope(child: SmartPendantApp()));
