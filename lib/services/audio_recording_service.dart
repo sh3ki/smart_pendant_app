@@ -55,12 +55,12 @@ class AudioRecordingService {
       await _recorder.start(
         const RecordConfig(
           encoder: AudioEncoder.wav, // WAV for Arduino compatibility (raw PCM)
-          bitRate: 128000, // Increased from 32k for better quality
-          sampleRate: 8000, // 8kHz for Arduino compatibility
+          bitRate: 128000, // High quality bitrate
+          sampleRate: 16000, // Increased to 16kHz for better voice quality (was 8kHz)
           numChannels: 1, // Mono
           autoGain: true, // Enable automatic gain control
-          echoCancel: false, // Disable to preserve audio loudness
-          noiseSuppress: false, // Disable to preserve audio loudness
+          echoCancel: false, // Disable to preserve natural audio
+          noiseSuppress: false, // Disable - was filtering out voice completely
         ),
         path: _currentRecordingPath!,
       );
@@ -203,7 +203,7 @@ class AudioRecordingService {
   }
 
   // Amplify audio by modifying the WAV file samples
-  Future<String?> getAmplifiedRecordingAsBase64(String filePath, {double gain = 8.0}) async {
+  Future<String?> getAmplifiedRecordingAsBase64(String filePath, {double gain = 3.0}) async {
     try {
       final file = File(filePath);
       if (!await file.exists()) return null;
