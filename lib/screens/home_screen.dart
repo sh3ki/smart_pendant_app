@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:location/location.dart' as loc;
+import 'dart:async';
 import '../providers/telemetry_provider.dart';
 import '../providers/panic_alert_provider.dart';
 import '../utils/time_utils.dart';
@@ -12,6 +14,13 @@ class HomeScreen extends ConsumerStatefulWidget {
 }
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
+  loc.Location _location = loc.Location();
+  StreamSubscription<loc.LocationData>? _locationSubscription;
+  double? _deviceLat;
+  double? _deviceLon;
+  double? _deviceAccuracy;
+  double? _deviceSpeed;
+
   @override
   void initState() {
     super.initState();
@@ -19,6 +28,51 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       // Initialize the provider (this triggers WebSocket connection)
       ref.read(panicAlertProvider);
+    });
+    _startLocationTracking();
+  }
+
+  @override
+  void dispose() {
+    _locationSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _startLocationTracking() async {
+    bool serviceEnabled = await _location.serviceEnabled();
+    if (!serviceEnabled) {
+      serviceEnabled = await _location.requestService();
+      if (!serviceEnabled) {
+        print('❌ Location service not enabled');
+        return;
+      }
+    }
+
+    // Get initial location
+    try {
+      final locationData = await _location.getLocation();
+      if (mounted) {
+        setState(() {
+          _deviceLat = locationData.latitude;
+          _deviceLon = locationData.longitude;
+          _deviceAccuracy = locationData.accuracy;
+          _deviceSpeed = locationData.speed;
+        });
+      }
+    } catch (e) {
+      print('❌ Failed to get device location: $e');
+    }
+
+    // Listen to location updates
+    _locationSubscription = _location.onLocationChanged.listen((locationData) {
+      if (mounted && locationData.latitude != null && locationData.longitude != null) {
+        setState(() {
+          _deviceLat = locationData.latitude;
+          _deviceLon = locationData.longitude;
+          _deviceAccuracy = locationData.accuracy;
+          _deviceSpeed = locationData.speed;
+        });
+      }
     });
   }
 
@@ -128,15 +182,27 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
-                            '${telemetry?.lat.toStringAsFixed(6)}, ${telemetry?.lon.toStringAsFixed(6)}',
+                            _deviceLat != null && _deviceLon != null
+                                ? '${_deviceLat!.toStringAsFixed(6)}, ${_deviceLon!.toStringAsFixed(6)}'
+                                : 'Getting location...',
                             style: Theme.of(context).textTheme.bodyMedium,
                           ),
                         ),
                       ],
                     ),
                     const SizedBox(height: 4),
-                    Text('Accuracy: ${telemetry?.accuracyMeters.toStringAsFixed(1)}%', style: Theme.of(context).textTheme.bodySmall),
-                    Text('Speed: ${telemetry?.displaySpeed.toStringAsFixed(1)} m/s', style: Theme.of(context).textTheme.bodySmall),
+                    Text(
+                      _deviceAccuracy != null
+                          ? 'Accuracy: ${(_deviceAccuracy! * 100 / 20).clamp(0, 100).toStringAsFixed(1)}%'
+                          : 'Accuracy: --',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                    Text(
+                      _deviceSpeed != null
+                          ? 'Speed: ${_deviceSpeed!.toStringAsFixed(1)} m/s'
+                          : 'Speed: 0.0 m/s',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                   ],
                 ),
               ),
