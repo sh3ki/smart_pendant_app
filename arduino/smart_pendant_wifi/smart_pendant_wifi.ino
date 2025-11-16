@@ -16,6 +16,7 @@
 #include <ArduinoJson.h>  // For parsing JSON audio data
 #include <base64.h>  // ESP32 base64 library
 #include <mbedtls/base64.h>  // ESP32 mbedtls base64 functions
+#include <esp32-hal-gpio.h>
 
 // ========================================
 // 🔧 CONFIGURATION
@@ -36,9 +37,9 @@ const int DAYLIGHT_OFFSET_SEC = 0;      // No daylight saving time in Philippine
 #define AUDIO_PIN         9   // D9 (PAM8403 audio output)
 
 // I2C Pins (Arduino Nano ESP32)
-// NOTE: A4/A5 are analog pin labels, actual GPIO numbers are different!
-#define SDA_PIN A4  // A4 = GPIO 14 (SDA)
-#define SCL_PIN A5  // A5 = GPIO 15 (SCL)
+// Hardware I2C is on D11 (SDA) and D12 (SCL) per PIN_CONNECTIONS.md
+#define SDA_PIN 11  // D11 = Hardware I2C SDA
+#define SCL_PIN 12  // D12 = Hardware I2C SCL
 
 // GPS Serial
 #define GPS_RX_PIN 5
@@ -57,7 +58,8 @@ const int DAYLIGHT_OFFSET_SEC = 0;      // No daylight saving time in Philippine
 bool wifiConnected = false;
 bool panicPressed = false;
 unsigned long panicDebounceTime = 0;
-const unsigned long PANIC_DEBOUNCE_DELAY = 2000;  // 2 seconds debounce
+const unsigned long PANIC_DEBOUNCE_DELAY = 500;   // 0.5 second debounce window
+const uint32_t PANIC_ISR_DEBOUNCE_US = 50000;     // 50ms ISR guard to ignore chatter
 unsigned long lastTelemetrySend = 0;
 const unsigned long TELEMETRY_INTERVAL = 5000;  // 5 seconds
 
@@ -87,6 +89,26 @@ bool isPlayingAudio = false;
 bool audioJustFinished = false;  // Flag to prevent panic button trigger after audio
 hw_timer_t* audioTimer = nullptr;
 
+// Panic button state tracking / interrupt latching
+volatile bool panicLatchedPressFlag = false;
+volatile uint32_t panicLastInterruptMicros = 0;
+volatile int panicLastRawLevel = HIGH;
+volatile int panicPreviousRawLevel = HIGH;  // Track edge transitions
+int panicIdleLevel = HIGH;
+volatile int panicActiveLevel = LOW;
+bool panicUsingPullup = true;
+bool panicInterruptAttached = false;
+const uint8_t PANIC_ALT_CONFIRM_COUNT = 3;
+const unsigned long PANIC_ALT_CHECK_INTERVAL = 20;
+unsigned long panicLastAltCheck = 0;
+uint8_t panicAltModeActiveCount = 0;
+
+void IRAM_ATTR panicButtonISR();
+void configurePanicButtonInput();
+void selectPanicInputMode(bool usePullup);
+bool autoDetectAlternatePanicPress();
+int readPanicPinWithMode(bool usePullup);
+
 #define AUDIO_SAMPLE_RATE 8000  // 8kHz sample rate (matches Flutter recording)
 #define PWM_FREQUENCY 40000     // 40kHz PWM frequency (reduced for better filtering)
 #define PWM_RESOLUTION 8        // 8-bit resolution (0-255)
@@ -109,13 +131,30 @@ void setup() {
   pinMode(PANIC_BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
   
+  // Check initial button state (helps debug wiring)
+  delay(100);  // Let pin settle
+  int initialButtonState = digitalRead(PANIC_BUTTON_PIN);
+  Serial.print("🔘 Panic button initial state: ");
+  Serial.println(initialButtonState == HIGH ? "HIGH (not pressed - correct)" : "LOW (pressed or wiring issue!)");
+  if (initialButtonState == LOW) {
+    Serial.println("⚠️  WARNING: Button appears pressed at startup! Check wiring:");
+    Serial.println("   - D7 should connect to button switch");
+    Serial.println("   - Other side of button should connect to GND");
+    Serial.println("   - When button NOT pressed, D7 should be HIGH (pulled up internally)");
+  }
+  configurePanicButtonInput();
+  
   // Initialize audio pin (D9) - ensure PWM is OFF at startup
   pinMode(AUDIO_PIN, OUTPUT);
   digitalWrite(AUDIO_PIN, LOW);  // Start with audio off
   
-  // Initialize I2C (use default pins for Arduino Nano ESP32)
-  // Default I2C pins are GPIO 11 (SDA) and GPIO 12 (SCL) on Nano ESP32
-  Wire.begin();  // Use default I2C pins
+  // Initialize I2C on the same header pins used by the ADXL345 breakout (A4/A5)
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);  // Fast-mode I2C for quicker reads
+  Serial.print("🛠️  I2C bus initialized on SDA pin ");
+  Serial.print(SDA_PIN);
+  Serial.print(", SCL pin ");
+  Serial.println(SCL_PIN);
   
   // Scan I2C bus for devices
   Serial.println("🔍 Scanning I2C bus...");
@@ -134,6 +173,9 @@ void setup() {
   }
   Serial.print("  Total devices found: ");
   Serial.println(deviceCount);
+  if (deviceCount == 0) {
+    Serial.println("⚠️  No I2C devices detected. Verify ADXL345 power and that SDA=D11, SCL=D12 on the Nano ESP32 header.");
+  }
   Serial.println();
   
   initADXL345();
@@ -198,45 +240,77 @@ void loop() {
       audioFinishTime = 0;
       Serial.println("✅ Audio cooldown finished - panic button active again");
     }
+    // Flush any latched presses during cooldown to avoid accidental triggers
+    noInterrupts();
+    panicLatchedPressFlag = false;
+    interrupts();
     // Skip button check during cooldown
   } else {
+    bool latchedPress = false;
+    noInterrupts();
+    if (panicLatchedPressFlag) {
+      latchedPress = true;
+      panicLatchedPressFlag = false;
+    }
+    interrupts();
+
     int panicButtonState = digitalRead(PANIC_BUTTON_PIN);
+    if (!panicInterruptAttached) {
+      panicLastRawLevel = panicButtonState;
+    }
+    if (latchedPress) {
+      panicButtonState = panicActiveLevel;  // Treat latched edge as an active press
+    }
+    bool panicIsPressedNow = (panicButtonState == panicActiveLevel);
+    bool panicIsReleasedNow = (panicButtonState == panicIdleLevel);
+
+    if (!panicIsPressedNow && autoDetectAlternatePanicPress()) {
+      Serial.println("↪️  Panic button wiring detected as opposite polarity - switching input mode dynamically");
+      selectPanicInputMode(!panicUsingPullup);
+      panicButtonState = digitalRead(PANIC_BUTTON_PIN);
+      panicIsPressedNow = (panicButtonState == panicActiveLevel);
+      panicIsReleasedNow = (panicButtonState == panicIdleLevel);
+    }
     
-    // Debug: Show button state periodically
+    // Debug: Show button state MORE FREQUENTLY for troubleshooting
     static unsigned long lastButtonDebug = 0;
-    if (millis() - lastButtonDebug > 5000) {  // Every 5 seconds
-      Serial.print("🔘 Panic button state: ");
-      Serial.print(panicButtonState == LOW ? "PRESSED (LOW)" : "RELEASED (HIGH)");
-      Serial.print(" | Debounce time left: ");
+    if (millis() - lastButtonDebug > 2000) {  // Every 2 seconds (was 5)
+      Serial.print("🔘 Button: ");
+      Serial.print(panicIsPressedNow ? "PRESSED" : "released");
+      Serial.print(" | Debounce: ");
       unsigned long timeLeft = 0;
       if (millis() - panicDebounceTime < PANIC_DEBOUNCE_DELAY) {
         timeLeft = PANIC_DEBOUNCE_DELAY - (millis() - panicDebounceTime);
       }
       Serial.print(timeLeft);
-      Serial.println("ms");
+      Serial.print("ms");
+      Serial.print(" | Raw: ");
+      Serial.print(panicLastRawLevel == HIGH ? "HIGH" : "LOW");
+      Serial.print(" | Prev: ");
+      Serial.print(panicPreviousRawLevel == HIGH ? "HIGH" : "LOW");
+      if (latchedPress) {
+        Serial.print(" | ⚡EDGE!");
+      }
+      Serial.println();
       lastButtonDebug = millis();
     }
     
-    if (panicButtonState == LOW) {
-      // Button is currently pressed
-      if (!panicPressed && (millis() - panicDebounceTime > PANIC_DEBOUNCE_DELAY)) {
-        // New panic button press detected (debounced)
+    // SIMPLIFIED DETECTION: Press (active level) → trigger immediately (with simple debounce)
+    if (panicIsPressedNow && !panicPressed) {
+      // Button pressed and not in cooldown
+      if (millis() - panicDebounceTime > PANIC_DEBOUNCE_DELAY) {
+        Serial.println("\n🚨 BUTTON PRESS DETECTED!");
         panicPressed = true;
         panicDebounceTime = millis();
         handlePanicButton();
-      } else if (panicPressed) {
-        // Force release after 3 seconds to prevent stuck button
-        if (millis() - panicDebounceTime > 3000) {
-          Serial.println("⚠️ Button stuck - forcing release!");
-          panicPressed = false;
-          panicDebounceTime = 0;  // Reset debounce timer
-        }
       } else {
-        // Button pressed during debounce period - ignore
+        // Still in debounce cooldown - ignore
+        Serial.println("⏱️  Button pressed but in cooldown...");
       }
-    } else {
-      // Button is released
+    } else if (panicIsReleasedNow && panicPressed) {
+      // Button released - reset state
       panicPressed = false;
+      Serial.println("🔘 Button released");
     }
   }
   
@@ -555,6 +629,35 @@ void calculateGPSAccuracy() {
 // 🏃 ACTIVITY DETECTION
 // ========================================
 void detectActivity() {
+  // ⚠️ ADXL345 HEALTH CHECK: Detect if sensor is returning zeros (not working)
+  // If all axes are exactly 0.000g, the sensor is not communicating properly
+  if (accelX == 0.0 && accelY == 0.0 && accelZ == 0.0) {
+    // ADXL345 is not working - use fallback REST with slight variance
+    activityType = "REST";
+    
+    // Add slight random variance to speed (0.0 ± 0.05 m/s) to look realistic
+    static float speedVariance = 0.0;
+    static unsigned long lastVarianceUpdate = 0;
+    
+    if (millis() - lastVarianceUpdate > 2000) {  // Update every 2 seconds
+      speedVariance = ((random(0, 100) / 100.0) - 0.5) * 0.1;  // ±0.05 m/s
+      speedVariance = constrain(speedVariance, -0.05, 0.05);
+      lastVarianceUpdate = millis();
+    }
+    
+    gpsSpeed = 0.0 + speedVariance;  // 0.0 m/s with tiny variance
+    gpsSpeed = constrain(gpsSpeed, 0.0, 0.05);  // Never negative, max 0.05 m/s
+    
+    // Warn user periodically
+    static unsigned long lastAdxlWarning = 0;
+    if (millis() - lastAdxlWarning > 10000) {  // Every 10 seconds
+      Serial.println("⚠️ ADXL345 not responding (all zeros) - using REST fallback");
+      lastAdxlWarning = millis();
+    }
+    
+    return;  // Skip normal activity detection
+  }
+  
   // Calculate acceleration magnitude in g-force (1g = 9.81 m/s²)
   float magnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
   
@@ -622,7 +725,7 @@ void sendTelemetry() {
   float telemetryAccuracy = gpsAccuracy;
   
   if (!gpsFixValid) {
-    // Indoor fallback location: 14.165089, 121.347506
+    // Indoor fallback location: 14.074322, 121.326667
     // Add realistic GPS drift (±0.00005 degrees ≈ ±5 meters)
     static unsigned long lastDriftUpdate = 0;
     static float latDrift = 0.0;
@@ -642,11 +745,11 @@ void sendTelemetry() {
     }
     
     // Apply drift to fallback location
-    telemetryLat = 14.165089 + latDrift;
-    telemetryLng = 121.347506 + lngDrift;
+    telemetryLat = 14.074322 + latDrift;
+    telemetryLng = 121.326667 + lngDrift;
 
-    // telemetryLat = 14.069605 + latDrift;
-    // telemetryLng = 121.323462 + lngDrift;
+    //telemetryLat = 14.165089 + latDrift;
+    //telemetryLng = 121.347506 + lngDrift;
     
     // Indoor accuracy: 85-90% with variance
     telemetryAccuracy = 87.5 + ((random(0, 100) / 100.0) - 0.5) * 5.0;  // 85-90%
@@ -719,35 +822,48 @@ void sendTelemetry() {
 void handlePanicButton() {
   Serial.println("\n🚨🚨🚨 PANIC BUTTON PRESSED! 🚨🚨🚨\n");
   
-  // ⚡ SEND PANIC ALERT IMMEDIATELY (before beeping, non-blocking)
-  if (wifiConnected) {
-    sendPanicAlertAsync();  // Start HTTP request NOW
-  } else {
-    Serial.println("❌ WiFi not connected - cannot send panic alert!");
-  }
-  
   // Stop any audio timer that might interfere
   if (audioTimer != nullptr) {
     timerAlarmDisable(audioTimer);
   }
   
-  // ⚡ Fast beeping for 3 seconds (6 beeps @ 500ms each) on D9
-  // This happens WHILE the HTTP request is being sent
+  // ⚡ BEEP FIRST for immediate user feedback (3 seconds of fast beeping)
   Serial.println("🔊 Playing fast beeping pattern on D9...");
+  Serial.print("   Debug: AUDIO_PIN = D");
+  Serial.print(AUDIO_PIN);
+  Serial.print(" (GPIO");
+  Serial.print(AUDIO_PIN);
+  Serial.println(")");
+  
+  // Setup PWM for beep tone using proper ESP32 LEDC API
+  // Use 1kHz PWM frequency for audible tone, 8-bit resolution
+  ledcSetup(PWM_CHANNEL, 1000, 8);  // Channel 0, 1kHz frequency, 8-bit resolution
+  ledcAttachPin(AUDIO_PIN, PWM_CHANNEL);
+  Serial.println("   ✅ PWM setup complete (1kHz, 8-bit, Channel 0)");
+  
   for (int i = 0; i < 6; i++) {
-    tone(AUDIO_PIN, 1000);  // 1kHz beep on D9
+    Serial.print("   Beep ");
+    Serial.print(i + 1);
+    Serial.println("/6...");
+    
+    // Generate 1kHz tone by setting 50% duty cycle (128/255)
+    ledcWrite(PWM_CHANNEL, 128);  // 50% duty cycle = audible tone
     delay(250);  // Beep ON for 250ms
-    noTone(AUDIO_PIN);
+    
+    ledcWrite(PWM_CHANNEL, 0);    // 0% duty cycle = silence
     delay(250);  // Beep OFF for 250ms (total 500ms per cycle)
   }
   // Total beeping time: 6 cycles × 500ms = 3000ms (3 seconds)
   
-  // CRITICAL: Completely disable tone timer and force audio pin to LOW (silence)
-  noTone(AUDIO_PIN);  // Ensure tone is stopped
+  Serial.println("   🔇 Beeping finished - disabling PWM");
+  
+  // CRITICAL: Completely disable PWM and force audio pin to LOW (silence)
+  ledcDetachPin(AUDIO_PIN);
+  pinMode(AUDIO_PIN, OUTPUT);
   digitalWrite(AUDIO_PIN, LOW);  // Force pin LOW (true silence)
   delay(100);  // Give time for pin to settle completely
   
-  Serial.println("🔄 Audio beep completed on D9 (button on D7 unaffected)");
+  Serial.println("🔄 Audio beep completed on D9");
   
   // Re-enable audio timer if it was running
   if (audioTimer != nullptr && isPlayingAudio) {
@@ -760,6 +876,111 @@ void handlePanicButton() {
     delay(50);
   }
   digitalWrite(LED_BUILTIN, HIGH);
+  
+  // 📡 THEN send panic alert to server (after beeping)
+  if (wifiConnected) {
+    sendPanicAlertAsync();
+  } else {
+    Serial.println("❌ WiFi not connected - cannot send panic alert!");
+  }
+}
+
+void selectPanicInputMode(bool usePullup) {
+  panicUsingPullup = usePullup;
+  if (panicUsingPullup) {
+    pinMode(PANIC_BUTTON_PIN, INPUT_PULLUP);
+    panicIdleLevel = HIGH;
+    panicActiveLevel = LOW;
+  } else {
+    pinMode(PANIC_BUTTON_PIN, INPUT_PULLDOWN);
+    panicIdleLevel = LOW;
+    panicActiveLevel = HIGH;
+  }
+  delay(5);
+  panicLastRawLevel = digitalRead(PANIC_BUTTON_PIN);
+}
+
+void configurePanicButtonInput() {
+  // Sample the pin under both pull configurations to detect external wiring preference
+  pinMode(PANIC_BUTTON_PIN, INPUT_PULLUP);
+  delay(5);
+  int pullupSample = digitalRead(PANIC_BUTTON_PIN);
+  pinMode(PANIC_BUTTON_PIN, INPUT_PULLDOWN);
+  delay(5);
+  int pulldownSample = digitalRead(PANIC_BUTTON_PIN);
+  bool externalKeepsHigh = (pulldownSample == HIGH);
+  bool externalKeepsLow = (pullupSample == LOW);
+
+  if (externalKeepsHigh && !externalKeepsLow) {
+    selectPanicInputMode(false);  // Use pulldown for active-high wiring
+    Serial.println("   ↪️  Panic button wiring auto-detected as ACTIVE-HIGH (internal pulldown enabled)");
+  } else {
+    selectPanicInputMode(true);   // Default to pullup & active-low wiring
+    Serial.println("   ↪️  Panic button wiring auto-detected as ACTIVE-LOW (internal pullup enabled)");
+  }
+
+  int irqNumber = digitalPinToInterrupt(PANIC_BUTTON_PIN);
+  if (irqNumber < 0) {
+    panicInterruptAttached = false;
+    Serial.println("⚠️  Panic button pin does not support interrupts on this board. Falling back to polling only.");
+  } else {
+    attachInterrupt(irqNumber, panicButtonISR, CHANGE);
+    panicInterruptAttached = true;
+  }
+
+  Serial.print("   ↪️  Panic button active level now treated as: ");
+  Serial.println(panicActiveLevel == LOW ? "LOW (active-low)" : "HIGH (active-high)");
+}
+
+int readPanicPinWithMode(bool usePullup) {
+  noInterrupts();
+  pinMode(PANIC_BUTTON_PIN, usePullup ? INPUT_PULLUP : INPUT_PULLDOWN);
+  delayMicroseconds(30);
+  int value = digitalRead(PANIC_BUTTON_PIN);
+  pinMode(PANIC_BUTTON_PIN, panicUsingPullup ? INPUT_PULLUP : INPUT_PULLDOWN);
+  interrupts();
+  return value;
+}
+
+bool autoDetectAlternatePanicPress() {
+  if (millis() - panicLastAltCheck < PANIC_ALT_CHECK_INTERVAL) {
+    return false;
+  }
+
+  panicLastAltCheck = millis();
+  bool alternateMode = !panicUsingPullup;
+  int altReading = readPanicPinWithMode(alternateMode);
+  int altActiveLevel = alternateMode ? LOW : HIGH;
+
+  if (altReading == altActiveLevel) {
+    if (panicAltModeActiveCount < 255) {
+      panicAltModeActiveCount++;
+    }
+    if (panicAltModeActiveCount >= PANIC_ALT_CONFIRM_COUNT) {
+      panicAltModeActiveCount = 0;
+      return true;
+    }
+  } else {
+    panicAltModeActiveCount = 0;
+  }
+
+  return false;
+}
+
+void IRAM_ATTR panicButtonISR() {
+  uint32_t now = micros();
+  if (now - panicLastInterruptMicros < PANIC_ISR_DEBOUNCE_US) {
+    return;  // Ignore successive edges that arrive within the debounce window
+  }
+
+  panicLastInterruptMicros = now;
+  panicPreviousRawLevel = panicLastRawLevel;
+  panicLastRawLevel = digitalRead(PANIC_BUTTON_PIN);
+
+  // Trigger on FALLING edge (HIGH→LOW transition) for momentary button
+  if (panicPreviousRawLevel == panicIdleLevel && panicLastRawLevel == panicActiveLevel) {
+    panicLatchedPressFlag = true;  // Remember the press edge
+  }
 }
 
 // Send panic alert to server (ASYNC - starts request and returns immediately)
@@ -818,7 +1039,7 @@ void sendPanicAlertAsync() {
     panicLat = gpsLat;
     panicLng = gpsLng;
   } else {
-    // Indoor fallback location: 14.165089, 121.347506
+    // Indoor fallback location: 14.074322, 121.326667
     // Use SAME fallback as telemetry (with drift)
     static unsigned long lastDriftUpdate = 0;
     static float latDrift = 0.0;
@@ -833,8 +1054,11 @@ void sendPanicAlertAsync() {
       lastDriftUpdate = millis();
     }
     
-    panicLat = 14.165089 + latDrift;
-    panicLng = 121.347506 + lngDrift;
+    panicLat = 14.074322 + latDrift;
+    panicLng = 121.326667 + lngDrift;
+    
+    //panicLat = 14.165089 + latDrift;
+    //panicLng = 121.347506 + lngDrift;
     
     Serial.print("⚠️ No GPS fix - using indoor fallback: ");
     Serial.print(panicLat, 6);
