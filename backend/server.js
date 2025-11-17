@@ -263,7 +263,7 @@ app.post('/api/audio/send', async (req, res) => {
     // Forward audio to Arduino
     // ⚠️ IMPORTANT: Set ARDUINO_IP environment variable or update default IP below
     // Find Arduino IP by uploading code and checking Serial Monitor for "IP Address: x.x.x.x"
-    const arduinoIp = process.env.ARDUINO_IP || '192.168.1.67'; // ⚠️ UPDATE THIS WITH YOUR ARDUINO'S IP!
+    const arduinoIp = process.env.ARDUINO_IP || '10.168.233.117'; // ⚠️ UPDATE THIS WITH YOUR ARDUINO'S IP!
     const arduinoUrl = `http://${arduinoIp}/audio`;
     
     console.log(`📤 Forwarding audio to Arduino at ${arduinoUrl}`);
