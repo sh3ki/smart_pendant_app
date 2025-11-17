@@ -11,7 +11,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>  // For HTTPS support
-#include <WebServer.h>
+#include <WebSocketsClient.h>  // WebSocket library for Arduino
 #include <Wire.h>
 #include <ArduinoJson.h>  // For parsing JSON audio data
 #include <base64.h>  // ESP32 base64 library
@@ -24,6 +24,9 @@
 const char* WIFI_SSID = "wifi";
 const char* WIFI_PASSWORD = "12345678";
 const char* SERVER_URL = "https://kiddieguard.onrender.com";  // Render deployment (public internet)
+const char* WEBSOCKET_HOST = "kiddieguard.onrender.com";  // WebSocket host (without https://)
+const int WEBSOCKET_PORT = 443;  // Use 443 for secure WebSocket (wss://)
+const char* WEBSOCKET_PATH = "/arduino";  // Arduino-specific WebSocket path
 
 // Timezone configuration (Asia/Manila = UTC+8)
 const long GMT_OFFSET_SEC = 8 * 3600;  // +8 hours in seconds
@@ -81,13 +84,14 @@ unsigned long lastActivityUpdate = 0;
 const unsigned long ACTIVITY_UPDATE_INTERVAL = 1000;  // Update activity every 1 second (more accurate)
 
 // Audio playback variables
-WebServer server(80);
+WebSocketsClient webSocket;  // WebSocket client for receiving audio
 int16_t* audioBuffer = nullptr;
 size_t audioBufferSize = 0;
 size_t audioPlaybackIndex = 0;
 bool isPlayingAudio = false;
 bool audioJustFinished = false;  // Flag to prevent panic button trigger after audio
 hw_timer_t* audioTimer = nullptr;
+bool webSocketConnected = false;  // Track WebSocket connection status
 
 // Panic button state tracking / interrupt latching
 volatile bool panicLatchedPressFlag = false;
@@ -197,8 +201,8 @@ void setup() {
   // DON'T setup audio PWM at startup - it interferes with button detection
   // setupAudioPWM();  // DISABLED - Will be set up when needed
   
-  // Setup Web Server for receiving audio
-  setupWebServer();
+  // Setup WebSocket connection to server
+  setupWebSocket();
   
   Serial.println("\n✅ Setup complete! Starting main loop...\n");
 }
@@ -207,8 +211,8 @@ void setup() {
 // 🔄 MAIN LOOP
 // ========================================
 void loop() {
-  // Handle web server requests
-  server.handleClient();
+  // Handle WebSocket events
+  webSocket.loop();
   
   // Check WiFi
   if (WiFi.status() != WL_CONNECTED) {
@@ -1093,6 +1097,163 @@ void sendPanicAlertAsync() {
 // 🎵 AUDIO PLAYBACK FUNCTIONS
 // ========================================
 
+// WebSocket event handler
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("🔌 WebSocket Disconnected");
+      webSocketConnected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.println("✅ WebSocket Connected to server");
+      webSocketConnected = true;
+      // Send a hello message
+      webSocket.sendTXT("{\"type\":\"hello\",\"device\":\"arduino-nano-esp32\"}");
+      break;
+      
+    case WStype_TEXT:
+      Serial.printf("📩 Received message: %s\n", payload);
+      handleWebSocketMessage((char*)payload, length);
+      break;
+      
+    case WStype_ERROR:
+      Serial.println("❌ WebSocket Error");
+      webSocketConnected = false;
+      break;
+      
+    default:
+      break;
+  }
+}
+
+// Handle incoming WebSocket messages
+void handleWebSocketMessage(char* payload, size_t length) {
+  // Parse JSON message
+  DynamicJsonDocument doc(512);
+  DeserializationError error = deserializeJson(doc, payload, length);
+  
+  if (error) {
+    Serial.print("❌ JSON parse error: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  const char* topic = doc["topic"];
+  
+  if (topic && strcmp(topic, "audio/play") == 0) {
+    Serial.println("🎵 Received audio play command");
+    
+    // Extract audio data from payload.audio
+    const char* audioBase64 = doc["payload"]["audio"];
+    
+    if (!audioBase64) {
+      Serial.println("❌ No audio data in message");
+      return;
+    }
+    
+    // Decode and play audio
+    playAudioFromBase64(audioBase64);
+  }
+}
+
+// Play audio from base64 string (extracted from WebSocket message)
+void playAudioFromBase64(const char* audioBase64) {
+  Serial.println("🎵 Decoding audio from base64...");
+  
+  size_t base64Len = strlen(audioBase64);
+  Serial.printf("   Base64 length: %d bytes\n", base64Len);
+  
+  // Calculate decoded size (base64 decodes to 3/4 of original size)
+  size_t decodedLen = (base64Len * 3) / 4;
+  Serial.printf("   Expected decoded size: %d bytes\n", decodedLen);
+  
+  // Allocate buffer for decoded audio (int16 samples)
+  if (audioBuffer != nullptr) {
+    free(audioBuffer);
+    audioBuffer = nullptr;
+  }
+  
+  audioBuffer = (int16_t*)malloc(decodedLen);
+  if (audioBuffer == nullptr) {
+    Serial.println("❌ Failed to allocate audio buffer");
+    return;
+  }
+  
+  // Decode base64 to raw PCM data using mbedtls
+  size_t actualDecodedLen = 0;
+  int ret = mbedtls_base64_decode(
+    (unsigned char*)audioBuffer,
+    decodedLen,
+    &actualDecodedLen,
+    (const unsigned char*)audioBase64,
+    base64Len
+  );
+  
+  if (ret != 0) {
+    Serial.printf("❌ Base64 decode failed (error %d)\n", ret);
+    free(audioBuffer);
+    audioBuffer = nullptr;
+    return;
+  }
+  
+  audioBufferSize = actualDecodedLen / 2;  // Convert bytes to int16 samples
+  Serial.printf("✅ Decoded %d bytes → %d samples\n", actualDecodedLen, audioBufferSize);
+  
+  // Setup audio PWM if not already done
+  if (!isPlayingAudio) {
+    setupAudioPWM();
+    
+    // Setup timer for 8kHz sample rate
+    audioTimer = timerBegin(0, 80, true);  // 80MHz / 80 = 1MHz timer
+    timerAttachInterrupt(audioTimer, &onAudioTimer, true);
+    timerAlarmWrite(audioTimer, 125, true);  // 1MHz / 125 = 8kHz
+    timerAlarmEnable(audioTimer);
+  }
+  
+  // Start playback
+  audioPlaybackIndex = 0;
+  isPlayingAudio = true;
+  audioJustFinished = false;
+  
+  Serial.println("▶️  Playing audio...");
+  
+  // Wait for playback to complete
+  while (isPlayingAudio && audioPlaybackIndex < audioBufferSize) {
+    delay(10);
+  }
+  
+  isPlayingAudio = false;
+  audioJustFinished = true;
+  Serial.println("⏹️  Audio playback complete");
+  
+  // Clean up
+  if (audioBuffer != nullptr) {
+    free(audioBuffer);
+    audioBuffer = nullptr;
+  }
+  audioBufferSize = 0;
+}
+
+// Setup WebSocket connection
+void setupWebSocket() {
+  Serial.println("🔌 Setting up WebSocket connection...");
+  Serial.printf("   Host: %s\n", WEBSOCKET_HOST);
+  Serial.printf("   Port: %d\n", WEBSOCKET_PORT);
+  Serial.printf("   Path: %s\n", WEBSOCKET_PATH);
+  
+  // Use secure WebSocket (wss://) for Render
+  webSocket.beginSSL(WEBSOCKET_HOST, WEBSOCKET_PORT, WEBSOCKET_PATH);
+  
+  // Set event handler
+  webSocket.onEvent(webSocketEvent);
+  
+  // Reconnect interval
+  webSocket.setReconnectInterval(5000);
+  
+  Serial.println("✅ WebSocket client configured");
+}
+
 // Setup PWM for audio output on D9 (called when needed, not at startup)
 void setupAudioPWM() {
   // Configure D9 as PWM output for audio
@@ -1117,219 +1278,5 @@ void IRAM_ATTR onAudioTimer() {
   ledcWrite(0, pwmValue);
 }
 
-// Setup Web Server
-void setupWebServer() {
-  // POST /audio endpoint - receives audio from Flutter app via backend
-  server.on("/audio", HTTP_POST, []() {
-    Serial.println("🎵 Received audio POST request");
-    
-    if (!server.hasArg("plain")) {
-      server.send(400, "application/json", "{\"error\":\"No body\"}");
-      return;
-    }
-    
-    String body = server.arg("plain");
-    Serial.printf("📦 Body size: %d bytes\n", body.length());
-    
-    // ⚡ MEMORY FIX: Extract base64 audio string directly without full JSON parsing
-    // The JSON is simple: {"audio":"<base64>","timestamp":"..."}
-    // We can find the base64 string without allocating huge JSON buffer
-    
-    int audioStart = body.indexOf("\"audio\":\"");
-    if (audioStart == -1) {
-      Serial.println("❌ No 'audio' field found in JSON");
-      server.send(400, "application/json", "{\"error\":\"No audio field\"}");
-      return;
-    }
-    
-    audioStart += 9; // Skip past "audio":"
-    int audioEnd = body.indexOf("\"", audioStart);
-    if (audioEnd == -1) {
-      Serial.println("❌ Malformed JSON - no closing quote for audio field");
-      server.send(400, "application/json", "{\"error\":\"Malformed JSON\"}");
-      return;
-    }
-    
-    // Extract base64 audio string (this is just a reference, no copy)
-    String base64Audio = body.substring(audioStart, audioEnd);
-    Serial.printf("📥 Base64 audio length: %d\n", base64Audio.length());
-    
-    // Decode base64 to raw audio bytes using ESP32's base64 library
-    size_t base64Len = base64Audio.length();
-    const char* base64Str = base64Audio.c_str();
-    
-    // Calculate expected decoded size: base64 uses 4 chars for 3 bytes
-    // Formula: (base64Len / 4) * 3, accounting for padding
-    size_t decodedSize = (base64Len / 4) * 3;
-    if (base64Len > 0 && base64Str[base64Len - 1] == '=') decodedSize--;
-    if (base64Len > 1 && base64Str[base64Len - 2] == '=') decodedSize--;
-    
-    if (decodedSize == 0) {
-      Serial.println("❌ Invalid base64 data");
-      server.send(400, "application/json", "{\"error\":\"Invalid base64\"}");
-      return;
-    }
-    
-    Serial.printf("📊 Allocating %d bytes for decoded audio\n", decodedSize);
-    uint8_t* decodedData = (uint8_t*)malloc(decodedSize);
-    
-    if (!decodedData) {
-      Serial.println("❌ Failed to allocate memory for decoded audio");
-      server.send(500, "application/json", "{\"error\":\"Out of memory\"}");
-      return;
-    }
-    
-    // Decode using ESP32 base64 library (from mbedtls)
-    size_t actualSize = 0;
-    int result = mbedtls_base64_decode(decodedData, decodedSize, &actualSize, 
-                                        (const unsigned char*)base64Str, base64Len);
-    
-    if (result != 0) {
-      Serial.printf("❌ Base64 decode failed with error: %d\n", result);
-      free(decodedData);
-      server.send(400, "application/json", "{\"error\":\"Base64 decode failed\"}");
-      return;
-    }
-    
-    Serial.printf("📊 Decoded audio size: %d bytes\n", actualSize);
-    
-    // WAV files start with a 44-byte header, audio data starts after that
-    // WAV format: RIFF header (12 bytes) + fmt chunk (24 bytes) + data chunk header (8 bytes) = 44 bytes
-    uint8_t* pcmData = decodedData;
-    size_t pcmDataSize = actualSize;
-    
-    // Check if it's a WAV file (starts with "RIFF")
-    if (actualSize > 44 && 
-        decodedData[0] == 'R' && decodedData[1] == 'I' && 
-        decodedData[2] == 'F' && decodedData[3] == 'F') {
-      Serial.println("📦 Detected WAV file format");
-      
-      // Skip WAV header (44 bytes) to get raw PCM data
-      pcmData = decodedData + 44;
-      pcmDataSize = actualSize - 44;
-      
-      Serial.printf("📊 PCM data size: %d bytes (after removing WAV header)\n", pcmDataSize);
-    } else {
-      Serial.println("📦 Assuming raw audio data (no WAV header detected)");
-    }
-    
-    // Play the audio through PWM
-    Serial.println("🔊 Playing audio through PWM on D7...");
-    
-    // Switch to PWM output mode on D9 - 40kHz for better filtering
-    ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);  // 40kHz PWM, 8-bit resolution
-    ledcAttachPin(AUDIO_PIN, PWM_CHANNEL);
-    ledcWrite(PWM_CHANNEL, 128);  // Start at midpoint (128) for proper audio centering
-    
-    delay(10);  // Small delay to stabilize PWM
-    
-    // Determine if audio is 8-bit or 16-bit
-    // WAV PCM is typically 16-bit (2 bytes per sample)
-    bool is16Bit = (pcmDataSize % 2 == 0);  // If size is even, likely 16-bit
-    
-    Serial.printf("🎵 Audio format: %s\n", is16Bit ? "16-bit PCM" : "8-bit PCM");
-    
-    if (is16Bit && pcmDataSize >= 2) {
-      // 16-bit PCM audio (2 bytes per sample)
-      size_t numSamples = pcmDataSize / 2;
-      Serial.printf("📊 Playing %d samples at 8kHz (%.1f seconds)\n", numSamples, (float)numSamples / 8000.0);
-      
-      // Calculate timing for 8kHz sample rate
-      const unsigned long sampleIntervalMicros = 125;  // 1000000 / 8000 = 125 microseconds
-      unsigned long nextSampleTime = micros() + sampleIntervalMicros;
-      
-      // Simple low-pass filter to smooth audio (reduces harsh transitions)
-      uint8_t previousSample = 128;  // Start at midpoint
-      const float SMOOTHING = 0.3;   // Smoothing factor (0.0-1.0) - REDUCED to preserve voice clarity
-      
-      for (size_t i = 0; i < numSamples; i++) {
-        // Read 16-bit sample (little-endian)
-        int16_t sample16 = (int16_t)(pcmData[i*2] | (pcmData[i*2 + 1] << 8));
-        
-        // Convert from 16-bit signed (-32768 to 32767) to 8-bit unsigned (0-255)
-        // Formula: output = (input / 256) + 128
-        int32_t scaled = ((int32_t)sample16 >> 8) + 128;
-        uint8_t sample8 = (uint8_t)constrain(scaled, 0, 255);
-        
-        // Apply simple low-pass filter (exponential moving average)
-        // This smooths out harsh transitions while preserving voice
-        sample8 = (uint8_t)((SMOOTHING * previousSample) + ((1.0 - SMOOTHING) * sample8));
-        previousSample = sample8;
-        
-        // Write sample to PWM (removed silence threshold - was filtering voice)
-        ledcWrite(PWM_CHANNEL, sample8);
-        
-        // Wait for next sample time (precise timing)
-        while (micros() < nextSampleTime) {
-          // Tight loop for accuracy
-        }
-        nextSampleTime += sampleIntervalMicros;
-      }
-      
-    } else {
-      // 8-bit PCM audio (1 byte per sample)
-      Serial.printf("📊 Playing %d samples at 8kHz (%.1f seconds)\n", pcmDataSize, (float)pcmDataSize / 8000.0);
-      
-      // Calculate timing for 8kHz sample rate
-      const unsigned long sampleIntervalMicros = 125;  // 1000000 / 8000 = 125 microseconds
-      unsigned long nextSampleTime = micros() + sampleIntervalMicros;
-      
-      // Simple low-pass filter to smooth audio
-      uint8_t previousSample = 128;  // Start at midpoint
-      const float SMOOTHING = 0.3;   // Smoothing factor - REDUCED to preserve voice clarity
-      
-      for (size_t i = 0; i < pcmDataSize; i++) {
-        uint8_t sample8 = pcmData[i];
-        
-        // Apply simple low-pass filter
-        sample8 = (uint8_t)((SMOOTHING * previousSample) + ((1.0 - SMOOTHING) * sample8));
-        previousSample = sample8;
-        
-        // Write 8-bit sample directly (removed silence threshold - was filtering voice)
-        ledcWrite(PWM_CHANNEL, sample8);
-        
-        // Wait for next sample time (precise timing)
-        while (micros() < nextSampleTime) {
-          // Tight loop for accuracy
-        }
-        nextSampleTime += sampleIntervalMicros;
-      }
-    }
-    
-    // CRITICAL: Return to midpoint (128) at end to prevent click/pop
-    ledcWrite(PWM_CHANNEL, 128);
-    delay(10);  // Brief hold at midpoint
-    
-    // ⚠️ CRITICAL: COMPLETELY DISABLE PWM to eliminate ALL noise on D9
-    ledcDetachPin(AUDIO_PIN);  // Detach PWM channel FIRST
-    pinMode(AUDIO_PIN, OUTPUT);  // Switch to OUTPUT
-    digitalWrite(AUDIO_PIN, LOW);  // Force pin to LOW (true silence)
-    delay(100);  // Wait for pin to settle completely
-    
-    Serial.println("✅ Audio playback completed on D9");
-    
-    // Reset panic button debounce to prevent false trigger
-    panicPressed = false;
-    panicDebounceTime = millis();  // Start fresh debounce period
-    audioJustFinished = true;  // Enable cooldown period to prevent false trigger
-    
-    Serial.println("⏱️  Starting 500ms cooldown before panic button re-activation");
-    
-    free(decodedData);
-    
-    server.send(200, "application/json", "{\"success\":true,\"message\":\"Audio received and played successfully\"}");
-    Serial.println("✅ Audio processing completed");
-  });
-  
-  // GET / - status endpoint
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/plain", "Smart Pendant Arduino - Audio Receiver Ready");
-  });
-  
-  server.begin();
-  Serial.println("🌐 Web Server started on port 80");
-  Serial.print("   Audio endpoint: http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/audio");
-}
-
+// Old HTTP server code removed - now using WebSocket for audio playback
+// See setupWebSocket() and webSocketEvent() functions above
