@@ -37,10 +37,39 @@ let deviceData = {
   panicPressed: false
 };
 
-// WebSocket connections (Flutter app clients)
-const clients = new Set();
+// WebSocket connections
+const clients = new Set();  // Flutter app clients
+const arduinoClients = new Set();  // Arduino clients
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  // Check if this is an Arduino connection (based on URL path)
+  const isArduino = req.url?.includes('/arduino');
+  
+  if (isArduino) {
+    console.log('🤖 Arduino connected via WebSocket');
+    console.log(`🔧 Total Arduino connections: ${arduinoClients.size + 1}`);
+    arduinoClients.add(ws);
+    
+    ws.on('close', () => {
+      console.log('🤖 Arduino disconnected');
+      arduinoClients.delete(ws);
+      console.log(`🔧 Remaining Arduino connections: ${arduinoClients.size}`);
+    });
+    
+    ws.on('message', (message) => {
+      try {
+        const data = JSON.parse(message);
+        console.log('🤖 Message from Arduino:', data);
+        // Handle messages from Arduino if needed
+      } catch (e) {
+        console.error('Invalid message from Arduino:', e);
+      }
+    });
+    
+    return;
+  }
+  
+  // Handle Flutter app connection
   console.log('📱 Flutter app connected');
   console.log(`👥 Total connected clients: ${clients.size + 1}`);
   clients.add(ws);
@@ -76,6 +105,21 @@ function broadcastToClients(topic, payload) {
       client.send(message);
     }
   });
+}
+
+// Broadcast to all Arduino clients
+function broadcastToArduino(topic, payload) {
+  const message = JSON.stringify({ topic, payload });
+  console.log(`📤 Broadcasting to ${arduinoClients.size} Arduino client(s):`, topic);
+  let sentCount = 0;
+  arduinoClients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+      sentCount++;
+    }
+  });
+  console.log(`✅ Sent to ${sentCount} Arduino client(s)`);
+  return sentCount;
 }
 
 // ========================================
@@ -259,45 +303,36 @@ app.post('/api/audio/send', async (req, res) => {
   console.log(`🎵 Audio recording received (${audio.length} bytes base64)`);
   console.log(`📅 Timestamp: ${timestamp}`);
   
-  try {
-    // Forward audio to Arduino
-    // ⚠️ IMPORTANT: Set ARDUINO_IP environment variable or update default IP below
-    // Find Arduino IP by uploading code and checking Serial Monitor for "IP Address: x.x.x.x"
-    const arduinoIp = process.env.ARDUINO_IP || '10.168.233.117'; // ⚠️ UPDATE THIS WITH YOUR ARDUINO'S IP!
-    const arduinoUrl = `http://${arduinoIp}/audio`;
-    
-    console.log(`📤 Forwarding audio to Arduino at ${arduinoUrl}`);
-    
-    // Use node's http module to send to Arduino
-    const axios = require('axios');
-    const arduinoResponse = await axios.post(arduinoUrl, {
-      audio: audio,
-      timestamp: timestamp
-    }, {
-      timeout: 60000, // 60 second timeout
-      headers: {
-        'Content-Type': 'application/json'
-      }
+  // Check if any Arduino is connected via WebSocket
+  if (arduinoClients.size === 0) {
+    console.log('⚠️ No Arduino connected via WebSocket');
+    return res.json({
+      success: false,
+      message: 'No Arduino connected. Please connect Arduino to WebSocket.',
+      connectedArduinos: 0
     });
-    
-    console.log(`✅ Audio successfully sent to Arduino`);
-    console.log(`   Arduino response:`, arduinoResponse.data);
-    
+  }
+  
+  // Broadcast audio to all connected Arduinos via WebSocket
+  const sentCount = broadcastToArduino('audio/play', {
+    audio: audio,
+    timestamp: timestamp,
+    deviceId: deviceId || 'pendant-1'
+  });
+  
+  if (sentCount > 0) {
+    console.log(`✅ Audio successfully broadcast to ${sentCount} Arduino(s)`);
     res.json({ 
       success: true, 
-      message: 'Audio sent to Arduino',
-      arduinoResponse: arduinoResponse.data
+      message: `Audio sent to ${sentCount} Arduino(s) via WebSocket`,
+      connectedArduinos: sentCount
     });
-    
-  } catch (error) {
-    console.error(`❌ Failed to send audio to Arduino:`, error.message);
-    
-    // Still return success to Flutter app even if Arduino is offline
+  } else {
+    console.log('❌ No active Arduino WebSocket connections');
     res.json({ 
-      success: true, 
-      message: 'Audio received but Arduino is offline',
-      error: error.message,
-      note: 'Audio will be cached for later delivery (TODO: implement caching)'
+      success: false, 
+      message: 'Arduino connected but WebSocket not ready',
+      connectedArduinos: arduinoClients.size
     });
   }
 });
