@@ -113,7 +113,6 @@ int readPanicPinWithMode(bool usePullup);
 #define PWM_FREQUENCY 40000     // 40kHz PWM frequency (reduced for better filtering)
 #define PWM_RESOLUTION 8        // 8-bit resolution (0-255)
 #define PWM_CHANNEL 0           // PWM channel for audio
-#define SILENCE_THRESHOLD 3     // Threshold to detect silence (reduce noise)
 
 // ========================================
 // ⚙️ SETUP
@@ -1220,7 +1219,7 @@ void setupWebServer() {
     // Switch to PWM output mode on D9 - 40kHz for better filtering
     ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);  // 40kHz PWM, 8-bit resolution
     ledcAttachPin(AUDIO_PIN, PWM_CHANNEL);
-    ledcWrite(PWM_CHANNEL, 0);  // Start at 0 (complete silence, no midpoint noise)
+    ledcWrite(PWM_CHANNEL, 128);  // Start at midpoint (128) for proper audio centering
     
     delay(10);  // Small delay to stabilize PWM
     
@@ -1239,9 +1238,9 @@ void setupWebServer() {
       const unsigned long sampleIntervalMicros = 125;  // 1000000 / 8000 = 125 microseconds
       unsigned long nextSampleTime = micros() + sampleIntervalMicros;
       
-      // Simple low-pass filter to smooth audio (reduces "shattered glass" effect)
+      // Simple low-pass filter to smooth audio (reduces harsh transitions)
       uint8_t previousSample = 128;  // Start at midpoint
-      const float SMOOTHING = 0.7;   // Smoothing factor (0.0-1.0, higher = smoother)
+      const float SMOOTHING = 0.3;   // Smoothing factor (0.0-1.0) - REDUCED to preserve voice clarity
       
       for (size_t i = 0; i < numSamples; i++) {
         // Read 16-bit sample (little-endian)
@@ -1253,17 +1252,11 @@ void setupWebServer() {
         uint8_t sample8 = (uint8_t)constrain(scaled, 0, 255);
         
         // Apply simple low-pass filter (exponential moving average)
-        // This smooths out harsh transitions that cause "broken radio" sound
+        // This smooths out harsh transitions while preserving voice
         sample8 = (uint8_t)((SMOOTHING * previousSample) + ((1.0 - SMOOTHING) * sample8));
         previousSample = sample8;
         
-        // NOISE REDUCTION: Detect silence and output true 0 instead of 128
-        // If sample is very close to midpoint (128), treat as silence
-        if (abs((int)sample8 - 128) < SILENCE_THRESHOLD) {
-          sample8 = 0;  // Complete silence - no PWM noise
-        }
-        
-        // Write sample to PWM
+        // Write sample to PWM (removed silence threshold - was filtering voice)
         ledcWrite(PWM_CHANNEL, sample8);
         
         // Wait for next sample time (precise timing)
@@ -1283,7 +1276,7 @@ void setupWebServer() {
       
       // Simple low-pass filter to smooth audio
       uint8_t previousSample = 128;  // Start at midpoint
-      const float SMOOTHING = 0.7;   // Smoothing factor
+      const float SMOOTHING = 0.3;   // Smoothing factor - REDUCED to preserve voice clarity
       
       for (size_t i = 0; i < pcmDataSize; i++) {
         uint8_t sample8 = pcmData[i];
@@ -1292,12 +1285,7 @@ void setupWebServer() {
         sample8 = (uint8_t)((SMOOTHING * previousSample) + ((1.0 - SMOOTHING) * sample8));
         previousSample = sample8;
         
-        // NOISE REDUCTION: Detect silence and output true 0 instead of 128
-        if (abs((int)sample8 - 128) < SILENCE_THRESHOLD) {
-          sample8 = 0;  // Complete silence - no PWM noise
-        }
-        
-        // Write 8-bit sample directly
+        // Write 8-bit sample directly (removed silence threshold - was filtering voice)
         ledcWrite(PWM_CHANNEL, sample8);
         
         // Wait for next sample time (precise timing)
@@ -1308,9 +1296,9 @@ void setupWebServer() {
       }
     }
     
-    // CRITICAL: Complete silence at end - output 0, NOT 128
-    ledcWrite(PWM_CHANNEL, 0);
-    delay(50);  // Hold silence for 50ms
+    // CRITICAL: Return to midpoint (128) at end to prevent click/pop
+    ledcWrite(PWM_CHANNEL, 128);
+    delay(10);  // Brief hold at midpoint
     
     // ⚠️ CRITICAL: COMPLETELY DISABLE PWM to eliminate ALL noise on D9
     ledcDetachPin(AUDIO_PIN);  // Detach PWM channel FIRST
