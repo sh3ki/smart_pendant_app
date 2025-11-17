@@ -274,7 +274,7 @@ app.post('/api/audio/send', async (req, res) => {
       audio: audio,
       timestamp: timestamp
     }, {
-      timeout: 10000, // 10 second timeout
+      timeout: 60000, // 60 second timeout
       headers: {
         'Content-Type': 'application/json'
       }
