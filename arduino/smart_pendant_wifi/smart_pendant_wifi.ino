@@ -93,6 +93,12 @@ bool audioJustFinished = false;  // Flag to prevent panic button trigger after a
 hw_timer_t* audioTimer = nullptr;
 bool webSocketConnected = false;  // Track WebSocket connection status
 
+// Fragment reassembly variables
+uint8_t* fragmentBuffer = nullptr;
+size_t fragmentBufferSize = 0;
+size_t fragmentTotalReceived = 0;
+bool receivingFragment = false;
+
 // Panic button state tracking / interrupt latching
 volatile bool panicLatchedPressFlag = false;
 volatile uint32_t panicLastInterruptMicros = 0;
@@ -112,9 +118,10 @@ void configurePanicButtonInput();
 void selectPanicInputMode(bool usePullup);
 bool autoDetectAlternatePanicPress();
 int readPanicPinWithMode(bool usePullup);
+void IRAM_ATTR onAudioTimer();  // Forward declaration for audio timer interrupt
 
 #define AUDIO_SAMPLE_RATE 8000  // 8kHz sample rate (matches Flutter recording)
-#define PWM_FREQUENCY 40000     // 40kHz PWM frequency (reduced for better filtering)
+#define PWM_FREQUENCY 80000     // 80kHz PWM frequency (higher = less audible noise)
 #define PWM_RESOLUTION 8        // 8-bit resolution (0-255)
 #define PWM_CHANNEL 0           // PWM channel for audio
 
@@ -213,6 +220,14 @@ void setup() {
 void loop() {
   // Handle WebSocket events
   webSocket.loop();
+  
+  // Debug: Show WebSocket status periodically
+  static unsigned long lastWsDebug = 0;
+  if (millis() - lastWsDebug > 10000) {  // Every 10 seconds
+    Serial.print("🔌 WebSocket Status: ");
+    Serial.println(webSocketConnected ? "✅ CONNECTED" : "❌ DISCONNECTED");
+    lastWsDebug = millis();
+  }
   
   // Check WiFi
   if (WiFi.status() != WL_CONNECTED) {
@@ -1102,40 +1117,203 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
       Serial.println("🔌 WebSocket Disconnected");
+      Serial.println("   Will auto-reconnect in 5 seconds...");
       webSocketConnected = false;
+      
+      // Clean up any incomplete fragments
+      if (fragmentBuffer != nullptr) {
+        free(fragmentBuffer);
+        fragmentBuffer = nullptr;
+      }
+      fragmentBufferSize = 0;
+      fragmentTotalReceived = 0;
+      receivingFragment = false;
       break;
       
     case WStype_CONNECTED:
       Serial.println("✅ WebSocket Connected to server");
+      Serial.printf("   Connected to: %s\n", payload);
       webSocketConnected = true;
       // Send a hello message
       webSocket.sendTXT("{\"type\":\"hello\",\"device\":\"arduino-nano-esp32\"}");
       break;
       
     case WStype_TEXT:
-      Serial.printf("📩 Received message: %s\n", payload);
+      Serial.printf("📩 Received TEXT message (%d bytes)\n", length);
       handleWebSocketMessage((char*)payload, length);
+      break;
+      
+    case WStype_BIN:
+      // Binary data - convert to text and handle as JSON
+      Serial.printf("📩 Received BINARY message (%d bytes)\n", length);
+      {
+        // Create a temporary buffer for the text (add null terminator)
+        char* textPayload = (char*)malloc(length + 1);
+        if (textPayload) {
+          memcpy(textPayload, payload, length);
+          textPayload[length] = '\0';  // Null terminate
+          handleWebSocketMessage(textPayload, length);
+          free(textPayload);
+        } else {
+          Serial.println("❌ Failed to allocate memory for binary message");
+        }
+      }
       break;
       
     case WStype_ERROR:
       Serial.println("❌ WebSocket Error");
+      if (payload && length > 0) {
+        Serial.printf("   Error details: %s\n", payload);
+      }
       webSocketConnected = false;
       break;
       
+    case WStype_PING:
+      Serial.println("💓 WebSocket Ping");
+      break;
+      
+    case WStype_PONG:
+      Serial.println("💓 WebSocket Pong");
+      break;
+      
+    case WStype_FRAGMENT_TEXT_START:
+      Serial.printf("📦 TEXT Fragment START (%d bytes)\n", length);
+      // Initialize fragment buffer
+      if (fragmentBuffer != nullptr) {
+        free(fragmentBuffer);
+      }
+      // Allocate buffer with +1 byte for null terminator
+      fragmentBufferSize = (length * 20) + 1;
+      Serial.printf("💾 Free heap: %d bytes\n", ESP.getFreeHeap());
+      fragmentBuffer = (uint8_t*)malloc(fragmentBufferSize);
+      if (fragmentBuffer) {
+        memcpy(fragmentBuffer, payload, length);
+        fragmentTotalReceived = length;
+        receivingFragment = true;
+        Serial.printf("   📝 Fragment buffer allocated: %d bytes\n", fragmentBufferSize);
+      } else {
+        Serial.println("❌ Failed to allocate fragment buffer");
+        receivingFragment = false;
+      }
+      break;
+      
+    case WStype_FRAGMENT_BIN_START:
+      Serial.printf("📦 BINARY Fragment START (%d bytes)\n", length);
+      // Initialize fragment buffer
+      if (fragmentBuffer != nullptr) {
+        free(fragmentBuffer);
+      }
+      // Allocate buffer with +1 byte for null terminator
+      fragmentBufferSize = (length * 20) + 1;
+      Serial.printf("💾 Free heap: %d bytes\n", ESP.getFreeHeap());
+      fragmentBuffer = (uint8_t*)malloc(fragmentBufferSize);
+      if (fragmentBuffer) {
+        memcpy(fragmentBuffer, payload, length);
+        fragmentTotalReceived = length;
+        receivingFragment = true;
+        Serial.printf("   📝 Fragment buffer allocated: %d bytes\n", fragmentBufferSize);
+      } else {
+        Serial.println("❌ Failed to allocate fragment buffer");
+        receivingFragment = false;
+      }
+      break;
+      
+    case WStype_FRAGMENT:
+      Serial.printf("📦 Fragment CONTINUE (%d bytes)\n", length);
+      if (receivingFragment && fragmentBuffer != nullptr) {
+        // Check if we have enough space
+        if (fragmentTotalReceived + length <= fragmentBufferSize) {
+          memcpy(fragmentBuffer + fragmentTotalReceived, payload, length);
+          fragmentTotalReceived += length;
+          Serial.printf("   📝 Total received: %d/%d bytes\n", fragmentTotalReceived, fragmentBufferSize);
+        } else {
+          Serial.println("❌ Fragment buffer overflow - discarding fragment");
+          free(fragmentBuffer);
+          fragmentBuffer = nullptr;
+          receivingFragment = false;
+        }
+      }
+      break;
+      
+    case WStype_FRAGMENT_FIN:
+      Serial.printf("📦 Fragment END (%d bytes)\n", length);
+      if (receivingFragment && fragmentBuffer != nullptr) {
+        // Append final fragment
+        if (fragmentTotalReceived + length <= fragmentBufferSize) {
+          memcpy(fragmentBuffer + fragmentTotalReceived, payload, length);
+          fragmentTotalReceived += length;
+          Serial.printf("✅ Fragment complete! Total: %d bytes\n", fragmentTotalReceived);
+          
+          // IMPORTANT: Null-terminate the buffer to use as a string
+          fragmentBuffer[fragmentTotalReceived] = '\0';
+          
+          // Print memory status
+          Serial.printf("💾 Free heap before processing: %d bytes\n", ESP.getFreeHeap());
+          
+          // Process the complete message (pass fragment buffer directly - no copy!)
+          handleWebSocketMessage((char*)fragmentBuffer, fragmentTotalReceived);
+          
+          Serial.printf("💾 Free heap after processing: %d bytes\n", ESP.getFreeHeap());
+        } else {
+          Serial.println("❌ Fragment buffer overflow on final fragment");
+        }
+        
+        // Clean up fragment buffer AFTER processing
+        free(fragmentBuffer);
+        fragmentBuffer = nullptr;
+        fragmentBufferSize = 0;
+        fragmentTotalReceived = 0;
+        receivingFragment = false;
+      }
+      break;
+      
     default:
+      Serial.printf("⚠️ WebSocket unknown event type: %d (%d bytes)\n", type, length);
       break;
   }
 }
 
 // Handle incoming WebSocket messages
 void handleWebSocketMessage(char* payload, size_t length) {
-  // Parse JSON message
-  DynamicJsonDocument doc(512);
-  DeserializationError error = deserializeJson(doc, payload, length);
+  // MEMORY OPTIMIZATION: Use zero-copy JSON parsing with filter
+  // Only extract what we need instead of loading entire document
+  
+  Serial.printf("📝 Parsing JSON (%d bytes)...\n", length);
+  
+  // Create a filter to only extract topic and payload.audio (saves memory)
+  StaticJsonDocument<200> filter;
+  filter["topic"] = true;
+  filter["payload"]["audio"] = true;
+  
+  // Use smaller document with filter (only loads filtered fields)
+  DynamicJsonDocument doc(1024);  // Small buffer since we're filtering
+  DeserializationError error = deserializeJson(doc, payload, length, DeserializationOption::Filter(filter));
   
   if (error) {
     Serial.print("❌ JSON parse error: ");
     Serial.println(error.c_str());
+    Serial.println("⚠️ Attempting manual JSON parsing...");
+    
+    // FALLBACK: Manual parsing for audio/play messages
+    // Find the base64 audio data directly in the payload string
+    char* audioStart = strstr(payload, "\"audio\":\"");
+    if (audioStart) {
+      audioStart += 9;  // Skip past "audio":"
+      char* audioEnd = strchr(audioStart, '"');
+      if (audioEnd) {
+        // Temporarily null-terminate to create a string
+        char originalChar = *audioEnd;
+        *audioEnd = '\0';
+        
+        Serial.printf("✅ Manual parse: Found audio data (%d bytes)\n", strlen(audioStart));
+        playAudioFromBase64(audioStart);
+        
+        // Restore original character
+        *audioEnd = originalChar;
+        return;
+      }
+    }
+    Serial.println("❌ Manual parse failed - no audio data found");
     return;
   }
   
@@ -1144,13 +1322,15 @@ void handleWebSocketMessage(char* payload, size_t length) {
   if (topic && strcmp(topic, "audio/play") == 0) {
     Serial.println("🎵 Received audio play command");
     
-    // Extract audio data from payload.audio
+    // Extract audio data from payload.audio (zero-copy - just a pointer)
     const char* audioBase64 = doc["payload"]["audio"];
     
     if (!audioBase64) {
       Serial.println("❌ No audio data in message");
       return;
     }
+    
+    Serial.printf("   Audio base64 length: %d bytes\n", strlen(audioBase64));
     
     // Decode and play audio
     playAudioFromBase64(audioBase64);
@@ -1198,13 +1378,17 @@ void playAudioFromBase64(const char* audioBase64) {
   }
   
   audioBufferSize = actualDecodedLen / 2;  // Convert bytes to int16 samples
-  Serial.printf("✅ Decoded %d bytes → %d samples\n", actualDecodedLen, audioBufferSize);
+  Serial.printf("✅ Decoded %d bytes → %d samples (%.1f seconds)\n", 
+                actualDecodedLen, audioBufferSize, (float)audioBufferSize / AUDIO_SAMPLE_RATE);
   
   // Setup audio PWM if not already done
   if (!isPlayingAudio) {
     setupAudioPWM();
     
     // Setup timer for 8kHz sample rate
+    if (audioTimer != nullptr) {
+      timerEnd(audioTimer);
+    }
     audioTimer = timerBegin(0, 80, true);  // 80MHz / 80 = 1MHz timer
     timerAttachInterrupt(audioTimer, &onAudioTimer, true);
     timerAlarmWrite(audioTimer, 125, true);  // 1MHz / 125 = 8kHz
@@ -1219,20 +1403,38 @@ void playAudioFromBase64(const char* audioBase64) {
   Serial.println("▶️  Playing audio...");
   
   // Wait for playback to complete
+  unsigned long playbackStart = millis();
   while (isPlayingAudio && audioPlaybackIndex < audioBufferSize) {
     delay(10);
+    
+    // Timeout protection (max 30 seconds)
+    if (millis() - playbackStart > 30000) {
+      Serial.println("⚠️ Audio playback timeout - stopping");
+      break;
+    }
   }
   
   isPlayingAudio = false;
   audioJustFinished = true;
-  Serial.println("⏹️  Audio playback complete");
   
-  // Clean up
+  unsigned long playbackDuration = millis() - playbackStart;
+  Serial.printf("⏹️  Audio playback complete (%.1f seconds)\n", playbackDuration / 1000.0);
+  
+  // Disable timer
+  if (audioTimer != nullptr) {
+    timerAlarmDisable(audioTimer);
+  }
+  
+  // Clean up and reset audio pin to silence
   if (audioBuffer != nullptr) {
     free(audioBuffer);
     audioBuffer = nullptr;
   }
   audioBufferSize = 0;
+  
+  // Reset PWM to silence (middle value)
+  ledcWrite(PWM_CHANNEL, 128);
+  delay(50);
 }
 
 // Setup WebSocket connection
@@ -1242,16 +1444,24 @@ void setupWebSocket() {
   Serial.printf("   Port: %d\n", WEBSOCKET_PORT);
   Serial.printf("   Path: %s\n", WEBSOCKET_PATH);
   
-  // Use secure WebSocket (wss://) for Render
-  webSocket.beginSSL(WEBSOCKET_HOST, WEBSOCKET_PORT, WEBSOCKET_PATH);
+  // IMPORTANT: For secure WebSocket (wss://), we need to disable SSL verification
+  // because Arduino's SSL library may have issues with some certificates
+  webSocket.beginSSL(WEBSOCKET_HOST, WEBSOCKET_PORT, WEBSOCKET_PATH, "", "");
   
   // Set event handler
   webSocket.onEvent(webSocketEvent);
   
+  // Enable heartbeat to keep connection alive (ping every 15 seconds, expect pong within 3 seconds)
+  webSocket.enableHeartbeat(15000, 3000, 2);
+  
   // Reconnect interval
   webSocket.setReconnectInterval(5000);
   
+  // Set authorization header if needed (empty for now)
+  // webSocket.setAuthorization("user", "password");
+  
   Serial.println("✅ WebSocket client configured");
+  Serial.println("   Attempting connection...");
 }
 
 // Setup PWM for audio output on D9 (called when needed, not at startup)
@@ -1272,10 +1482,17 @@ void IRAM_ATTR onAudioTimer() {
   
   // Get next audio sample and convert from int16 to uint8 (0-255)
   int16_t sample = audioBuffer[audioPlaybackIndex++];
-  uint8_t pwmValue = (uint8_t)((sample + 32768) >> 8);  // Convert -32768..32767 to 0..255
+  
+  // Apply simple low-pass filter to reduce noise (moving average with previous sample)
+  static int16_t prevSample = 0;
+  int16_t filteredSample = (sample + prevSample) / 2;  // Average current and previous sample
+  prevSample = sample;
+  
+  // Convert filtered sample from int16 (-32768..32767) to uint8 (0..255) for PWM
+  uint8_t pwmValue = (uint8_t)((filteredSample + 32768) >> 8);
   
   // Output to PWM
-  ledcWrite(0, pwmValue);
+  ledcWrite(PWM_CHANNEL, pwmValue);
 }
 
 // Old HTTP server code removed - now using WebSocket for audio playback
