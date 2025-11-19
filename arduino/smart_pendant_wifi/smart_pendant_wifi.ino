@@ -121,9 +121,10 @@ int readPanicPinWithMode(bool usePullup);
 void IRAM_ATTR onAudioTimer();  // Forward declaration for audio timer interrupt
 
 #define AUDIO_SAMPLE_RATE 8000  // 8kHz sample rate (matches Flutter recording)
-#define PWM_FREQUENCY 80000     // 80kHz PWM frequency (higher = less audible noise)
+#define PWM_FREQUENCY 32000     // 32kHz PWM frequency (optimal for 8kHz audio)
 #define PWM_RESOLUTION 8        // 8-bit resolution (0-255)
 #define PWM_CHANNEL 0           // PWM channel for audio
+#define AUDIO_VOLUME_BOOST 2.5  // Volume amplification (2.5x louder for clear voice)
 
 // ========================================
 // ⚙️ SETUP
@@ -1182,8 +1183,8 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       if (fragmentBuffer != nullptr) {
         free(fragmentBuffer);
       }
-      // Allocate buffer with +1 byte for null terminator
-      fragmentBufferSize = (length * 20) + 1;
+      // Allocate buffer with +1 byte for null terminator (50x multiplier for large audio)
+      fragmentBufferSize = (length * 50) + 1;
       Serial.printf("💾 Free heap: %d bytes\n", ESP.getFreeHeap());
       fragmentBuffer = (uint8_t*)malloc(fragmentBufferSize);
       if (fragmentBuffer) {
@@ -1203,8 +1204,8 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       if (fragmentBuffer != nullptr) {
         free(fragmentBuffer);
       }
-      // Allocate buffer with +1 byte for null terminator
-      fragmentBufferSize = (length * 20) + 1;
+      // Allocate buffer with +1 byte for null terminator (50x multiplier for large audio)
+      fragmentBufferSize = (length * 50) + 1;
       Serial.printf("💾 Free heap: %d bytes\n", ESP.getFreeHeap());
       fragmentBuffer = (uint8_t*)malloc(fragmentBufferSize);
       if (fragmentBuffer) {
@@ -1385,13 +1386,13 @@ void playAudioFromBase64(const char* audioBase64) {
   if (!isPlayingAudio) {
     setupAudioPWM();
     
-    // Setup timer for 8kHz sample rate
+    // Setup timer for 16kHz sample rate (2x faster = higher pitch, faster playback)
     if (audioTimer != nullptr) {
       timerEnd(audioTimer);
     }
     audioTimer = timerBegin(0, 80, true);  // 80MHz / 80 = 1MHz timer
     timerAttachInterrupt(audioTimer, &onAudioTimer, true);
-    timerAlarmWrite(audioTimer, 125, true);  // 1MHz / 125 = 8kHz
+    timerAlarmWrite(audioTimer, 62, true);  // 1MHz / 62 ≈ 16kHz (2x faster!)
     timerAlarmEnable(audioTimer);
   }
   
@@ -1410,31 +1411,41 @@ void playAudioFromBase64(const char* audioBase64) {
     // Timeout protection (max 30 seconds)
     if (millis() - playbackStart > 30000) {
       Serial.println("⚠️ Audio playback timeout - stopping");
+      isPlayingAudio = false;
       break;
     }
   }
   
   isPlayingAudio = false;
-  audioJustFinished = true;
   
   unsigned long playbackDuration = millis() - playbackStart;
   Serial.printf("⏹️  Audio playback complete (%.1f seconds)\n", playbackDuration / 1000.0);
   
-  // Disable timer
+  // CRITICAL: Stop and clean up timer FIRST (prevents interrupts during cleanup)
   if (audioTimer != nullptr) {
     timerAlarmDisable(audioTimer);
+    timerDetachInterrupt(audioTimer);
+    timerEnd(audioTimer);
+    audioTimer = nullptr;
+    Serial.println("✅ Audio timer stopped and freed");
   }
   
-  // Clean up and reset audio pin to silence
+  // Clean up audio buffer
   if (audioBuffer != nullptr) {
     free(audioBuffer);
     audioBuffer = nullptr;
   }
   audioBufferSize = 0;
+  audioPlaybackIndex = 0;
   
   // Reset PWM to silence (middle value)
   ledcWrite(PWM_CHANNEL, 128);
   delay(50);
+  
+  // Set flag to prevent panic button false trigger
+  audioJustFinished = true;
+  
+  Serial.println("✅ Audio cleanup complete - ready for next playback");
 }
 
 // Setup WebSocket connection
@@ -1467,10 +1478,10 @@ void setupWebSocket() {
 // Setup PWM for audio output on D9 (called when needed, not at startup)
 void setupAudioPWM() {
   // Configure D9 as PWM output for audio
-  ledcSetup(0, PWM_FREQUENCY, PWM_RESOLUTION);  // Channel 0, 40kHz, 8-bit
-  ledcAttachPin(AUDIO_PIN, 0);
-  ledcWrite(0, 128);  // Set to middle value (silence)
-  // Don't print - this is called dynamically
+  ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);  // 32kHz PWM, 8-bit resolution
+  ledcAttachPin(AUDIO_PIN, PWM_CHANNEL);
+  ledcWrite(PWM_CHANNEL, 128);  // Set to middle value (silence)
+  Serial.println("🔊 Audio PWM configured (32kHz, 8-bit)");
 }
 
 // Timer interrupt for audio playback at 8kHz
@@ -1480,18 +1491,21 @@ void IRAM_ATTR onAudioTimer() {
     return;
   }
   
-  // Get next audio sample and convert from int16 to uint8 (0-255)
+  // Get next audio sample (int16: -32768 to 32767)
   int16_t sample = audioBuffer[audioPlaybackIndex++];
   
-  // Apply simple low-pass filter to reduce noise (moving average with previous sample)
-  static int16_t prevSample = 0;
-  int16_t filteredSample = (sample + prevSample) / 2;  // Average current and previous sample
-  prevSample = sample;
+  // Apply volume boost for clearer voice (with clipping protection)
+  int32_t boostedSample = (int32_t)sample * AUDIO_VOLUME_BOOST;
   
-  // Convert filtered sample from int16 (-32768..32767) to uint8 (0..255) for PWM
-  uint8_t pwmValue = (uint8_t)((filteredSample + 32768) >> 8);
+  // Clip to prevent distortion
+  if (boostedSample > 32767) boostedSample = 32767;
+  if (boostedSample < -32768) boostedSample = -32768;
   
-  // Output to PWM
+  // Convert from int16 (-32768..32767) to uint8 (0..255) for PWM
+  // Add 32768 to shift from signed to unsigned range, then divide by 256
+  uint8_t pwmValue = (uint8_t)((boostedSample + 32768) >> 8);
+  
+  // Output to PWM (PAM8403 amplifier)
   ledcWrite(PWM_CHANNEL, pwmValue);
 }
 
